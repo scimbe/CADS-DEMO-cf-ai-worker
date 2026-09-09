@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "friseur-support-agent",
+  "account_id": "93376a92f261b9674714f0bb11eade57",
+  "main": "src/server.ts",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "SALON_AGENT", "class_name": "SalonAgent" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SalonAgent"] }
+  ],
+  "vars": {
+    "SALON_NAME": "Salon Schnittwerk",
+    "AUDIO_BRIDGE_URL": "http://127.0.0.1:58090",
+    "LIGHTLLM_BASE_URL": "https://llm-34a13a96.bunsenbrenner.org/v1",
+    "PUBLIC_BASE_URL": "https://assistent-cal-f29c55da.bunsenbrenner.org/agents/salon-agent/default"
+  }
+}

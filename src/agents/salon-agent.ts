@@ -1,0 +1,565 @@
+import { Agent } from "agents";
+import type { Connection } from "agents";
+import { withVoice, WorkersAIFluxSTT, type VoiceTurnContext } from "@cloudflare/voice";
+import { CtAgentBridgeTTS } from "../lib/ctagent-tts";
+import { LightLlmSTT } from "../lib/lightllm-stt";
+import { createWorkersAI } from "workers-ai-provider";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { streamText, tool, stepCountIs, type ToolSet } from "ai";
+import { z } from "zod";
+import type { Env } from "../env";
+import {
+  SERVICE_KEYS,
+  SERVICES,
+  type ServiceKey,
+  type Appointment,
+  type Blocker,
+  OPENING_HOURS,
+  getAvailableSlots,
+  isSlotFree,
+  isWithinBookingHorizon,
+  zonedTimeToUtcMs,
+  toDateStr,
+  toTimeStr,
+  formatDateHumanDe,
+  weekdayNameDe,
+  weekdayOfDateStr
+} from "../lib/calendar";
+import { buildSystemPrompt } from "../lib/prompt";
+
+// Thorsten/Piper-TTS (über den ct-agent-Bridge-Dienst) liefert WAV, nicht das Default mp3.
+const VoiceAgent = withVoice(Agent, { audioFormat: "wav" });
+const MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const LIGHTLLM_MODEL_ID = "local-devstral-small2";
+type LlmProviderName = "auto" | "workers-ai" | "lightllm";
+const SERVICE_KEY_ENUM = SERVICE_KEYS as [ServiceKey, ...ServiceKey[]];
+const DAY_MS = 86_400_000;
+
+function newId(): string {
+  return crypto.randomUUID();
+}
+
+interface TextDeltaLike {
+  type: string;
+  text?: string;
+}
+
+function isErrorPart(value: unknown): boolean {
+  return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "error";
+}
+
+async function* prependAndContinue<T>(first: IteratorResult<T>, rest: AsyncIterator<T>): AsyncGenerator<T> {
+  if (!first.done) yield first.value;
+  while (true) {
+    const next = await rest.next();
+    if (next.done) return;
+    yield next.value;
+  }
+}
+
+async function* dedupeConsecutiveTextDeltas<T extends TextDeltaLike>(
+  source: AsyncIterable<T>
+): AsyncGenerator<T> {
+  let lastTextDelta: string | undefined;
+  for await (const part of source) {
+    if (part.type === "text-delta") {
+      if (part.text === lastTextDelta) continue;
+      lastTextDelta = part.text;
+    } else {
+      lastTextDelta = undefined;
+    }
+    yield part;
+  }
+}
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" }
+  });
+}
+
+interface AppointmentRow {
+  id: string;
+  customer_name: string;
+  phone: string;
+  service: ServiceKey;
+  start_ts: number;
+  end_ts: number;
+  status: "confirmed" | "cancelled";
+  notes: string | null;
+  created_at: number;
+}
+
+interface BlockerRow {
+  id: string;
+  start_ts: number;
+  end_ts: number;
+  reason: string;
+  created_at: number;
+}
+
+function rowToAppointment(r: AppointmentRow): Appointment {
+  return {
+    id: r.id,
+    customerName: r.customer_name,
+    phone: r.phone,
+    service: r.service,
+    startTs: r.start_ts,
+    endTs: r.end_ts,
+    status: r.status,
+    notes: r.notes,
+    createdAt: r.created_at
+  };
+}
+
+function rowToBlocker(r: BlockerRow): Blocker {
+  return { id: r.id, startTs: r.start_ts, endTs: r.end_ts, reason: r.reason, createdAt: r.created_at };
+}
+
+export class SalonAgent extends VoiceAgent<Env> {
+  transcriber = new WorkersAIFluxSTT(this.env.AI);
+  tts = new CtAgentBridgeTTS({
+    bridgeUrl: this.env.AUDIO_BRIDGE_URL,
+    bridgeToken: this.env.AUDIO_BRIDGE_TOKEN,
+    voice: "primary"
+  });
+
+  // Kurzlebiger Zwischenspeicher für STT-Audio-Clips (LightLLM-Fallback):
+  // LLM2s speech_to_text-Handler holt sich die Datei per HTTPS-URL selbst ab,
+  // daher wird sie hier kurz unter /stt-audio/:id bereitgestellt statt hochgeladen.
+  #pendingSttClips = new Map<string, ArrayBuffer>();
+
+  createTranscriber(): import("@cloudflare/voice").Transcriber | null {
+    if (this.getLlmProviderSetting() !== "lightllm") return this.transcriber ?? null;
+    return new LightLlmSTT({
+      bridgeUrl: this.env.AUDIO_BRIDGE_URL,
+      bridgeToken: this.env.AUDIO_BRIDGE_TOKEN,
+      publicBaseUrl: this.env.PUBLIC_BASE_URL,
+      storeClip: (id, bytes) => this.#pendingSttClips.set(id, bytes)
+    });
+  }
+
+  onStart() {
+    this.sql`CREATE TABLE IF NOT EXISTS appointments (
+      id TEXT PRIMARY KEY,
+      customer_name TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      service TEXT NOT NULL,
+      start_ts INTEGER NOT NULL,
+      end_ts INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'confirmed',
+      notes TEXT,
+      created_at INTEGER NOT NULL
+    )`;
+    this.sql`CREATE TABLE IF NOT EXISTS blockers (
+      id TEXT PRIMARY KEY,
+      start_ts INTEGER NOT NULL,
+      end_ts INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )`;
+    this.sql`CREATE TABLE IF NOT EXISTS admin_sessions (
+      token TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL
+    )`;
+    this.sql`CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )`;
+  }
+
+  private getLlmProviderSetting(): LlmProviderName {
+    const rows = this.sql<{ value: string }>`SELECT value FROM settings WHERE key = 'llm_provider'`;
+    const value = rows[0]?.value;
+    return value === "workers-ai" || value === "lightllm" ? value : "auto";
+  }
+
+  private setLlmProviderSetting(value: LlmProviderName) {
+    this.sql`INSERT INTO settings (key, value) VALUES ('llm_provider', ${value})
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`;
+  }
+
+  async onCallStart(connection: Connection) {
+    await this.speak(connection, `Hallo, hier ist ${this.env.SALON_NAME}. Wie kann ich Ihnen helfen?`);
+  }
+
+  // ---------------------------------------------------------------------
+  // Datenzugriff
+  // ---------------------------------------------------------------------
+
+  private appointmentsAround(centerMs: number, windowDays = 3): Appointment[] {
+    const from = centerMs - windowDays * DAY_MS;
+    const to = centerMs + windowDays * DAY_MS;
+    const rows = this.sql<AppointmentRow>`SELECT * FROM appointments WHERE start_ts >= ${from} AND start_ts <= ${to}`;
+    return rows.map(rowToAppointment);
+  }
+
+  private blockersAround(centerMs: number, windowDays = 3): Blocker[] {
+    const from = centerMs - windowDays * DAY_MS;
+    const to = centerMs + windowDays * DAY_MS;
+    const rows = this.sql<BlockerRow>`SELECT * FROM blockers WHERE start_ts <= ${to} AND end_ts >= ${from}`;
+    return rows.map(rowToBlocker);
+  }
+
+  // ---------------------------------------------------------------------
+  // Sprachagent: Werkzeuge & Gesprächslogik
+  // ---------------------------------------------------------------------
+
+  private buildTools() {
+    const self = this;
+    return {
+      pruefe_verfuegbarkeit: tool({
+        description: "Prüft freie Termin-Slots an einem bestimmten Datum für eine Leistung.",
+        inputSchema: z.object({
+          datum: z.string().describe("Datum im Format YYYY-MM-DD"),
+          leistung: z.enum(SERVICE_KEY_ENUM)
+        }),
+        execute: async ({ datum, leistung }) => {
+          const now = Date.now();
+          if (!isWithinBookingHorizon(datum, now)) {
+            return { status: "zu_weit_in_zukunft", hinweis: "Termine sind maximal 60 Tage im Voraus buchbar." };
+          }
+          const dayStartMs = zonedTimeToUtcMs(datum, "00:00");
+          const appts = self.appointmentsAround(dayStartMs);
+          const blockers = self.blockersAround(dayStartMs);
+          const slots = getAvailableSlots({ dateStr: datum, service: leistung, appointments: appts, blockers, now });
+          if (slots.length === 0) {
+            return { status: "keine_freien_slots", wochentag: weekdayNameDe(datum) };
+          }
+          return {
+            status: "ok",
+            wochentag: weekdayNameDe(datum),
+            freie_zeiten: slots.slice(0, 8).map((s) => toTimeStr(s))
+          };
+        }
+      }),
+      termin_buchen: tool({
+        description: "Bucht einen neuen Termin, nachdem die Verfügbarkeit geprüft und bestätigt wurde.",
+        inputSchema: z.object({
+          name: z.string().describe("Name des Kunden"),
+          telefon: z.string().describe("Telefonnummer des Kunden"),
+          leistung: z.enum(SERVICE_KEY_ENUM),
+          datum: z.string().describe("YYYY-MM-DD"),
+          uhrzeit: z.string().describe("HH:mm")
+        }),
+        execute: async ({ name, telefon, leistung, datum, uhrzeit }) => {
+          const now = Date.now();
+          const startTs = zonedTimeToUtcMs(datum, uhrzeit);
+          const endTs = startTs + SERVICES[leistung].durationMin * 60000;
+          if (startTs < now + 30 * 60000) {
+            return { status: "zu_kurzfristig" };
+          }
+          const appts = self.appointmentsAround(startTs);
+          const blockers = self.blockersAround(startTs);
+          if (!isSlotFree({ startTs, endTs, appointments: appts, blockers })) {
+            return { status: "belegt" };
+          }
+          const apptId = newId();
+          self.sql`INSERT INTO appointments (id, customer_name, phone, service, start_ts, end_ts, status, created_at)
+            VALUES (${apptId}, ${name}, ${telefon}, ${leistung}, ${startTs}, ${endTs}, 'confirmed', ${now})`;
+          return {
+            status: "gebucht",
+            termin_id: apptId,
+            bestaetigung: `${formatDateHumanDe(datum)} um ${uhrzeit} Uhr`
+          };
+        }
+      }),
+      termine_suchen: tool({
+        description: "Findet bestehende, künftige Termine anhand der Telefonnummer (nötig vor Umbuchung/Absage).",
+        inputSchema: z.object({ telefon: z.string() }),
+        execute: async ({ telefon }) => {
+          const now = Date.now();
+          const rows = self.sql<AppointmentRow>`SELECT * FROM appointments
+            WHERE phone = ${telefon} AND status = 'confirmed' AND start_ts >= ${now}
+            ORDER BY start_ts ASC`;
+          const appts = rows.map(rowToAppointment);
+          if (appts.length === 0) return { status: "keine_termine" };
+          return {
+            status: "ok",
+            termine: appts.map((a) => ({
+              termin_id: a.id,
+              leistung: SERVICES[a.service].label,
+              wann: `${formatDateHumanDe(toDateStr(a.startTs))} um ${toTimeStr(a.startTs)} Uhr`
+            }))
+          };
+        }
+      }),
+      termin_absagen: tool({
+        description: "Sagt einen bestehenden Termin anhand seiner Termin-ID ab.",
+        inputSchema: z.object({ termin_id: z.string() }),
+        execute: async ({ termin_id }) => {
+          self.sql`UPDATE appointments SET status = 'cancelled' WHERE id = ${termin_id} AND status = 'confirmed'`;
+          return { status: "abgesagt" };
+        }
+      }),
+      termin_verschieben: tool({
+        description: "Verschiebt einen bestehenden Termin auf ein neues Datum/Uhrzeit.",
+        inputSchema: z.object({
+          termin_id: z.string(),
+          neues_datum: z.string().describe("YYYY-MM-DD"),
+          neue_uhrzeit: z.string().describe("HH:mm")
+        }),
+        execute: async ({ termin_id, neues_datum, neue_uhrzeit }) => {
+          const rows = self.sql<AppointmentRow>`SELECT * FROM appointments WHERE id = ${termin_id} AND status = 'confirmed'`;
+          if (rows.length === 0) return { status: "nicht_gefunden" };
+          const appt = rowToAppointment(rows[0]);
+          const newStart = zonedTimeToUtcMs(neues_datum, neue_uhrzeit);
+          const newEnd = newStart + SERVICES[appt.service].durationMin * 60000;
+          const dayAppts = self.appointmentsAround(newStart);
+          const dayBlockers = self.blockersAround(newStart);
+          if (
+            !isSlotFree({
+              startTs: newStart,
+              endTs: newEnd,
+              appointments: dayAppts,
+              blockers: dayBlockers,
+              excludeAppointmentId: termin_id
+            })
+          ) {
+            return { status: "belegt" };
+          }
+          self.sql`UPDATE appointments SET start_ts = ${newStart}, end_ts = ${newEnd} WHERE id = ${termin_id}`;
+          return { status: "verschoben", bestaetigung: `${formatDateHumanDe(neues_datum)} um ${neue_uhrzeit} Uhr` };
+        }
+      })
+    };
+  }
+
+  private streamFromProvider(providerName: "workers-ai" | "lightllm", system: string, messages: unknown[], tools: ToolSet) {
+    const model =
+      providerName === "workers-ai"
+        ? createWorkersAI({ binding: this.env.AI })(MODEL_ID)
+        : createOpenAICompatible({
+            name: "lightllm",
+            baseURL: this.env.LIGHTLLM_BASE_URL,
+            apiKey: this.env.LIGHTLLM_API_KEY
+          })(LIGHTLLM_MODEL_ID);
+    const result = streamText({
+      model,
+      system,
+      // biome-ignore lint: messages shape is validated by streamText itself
+      messages: messages as never,
+      tools,
+      stopWhen: stepCountIs(5)
+    });
+    return result.stream;
+  }
+
+  async onTurn(transcript: string, context: VoiceTurnContext) {
+    const system = buildSystemPrompt({ salonName: this.env.SALON_NAME, nowMs: Date.now() });
+    const messages = [...context.messages, { role: "user", content: transcript }];
+    const tools = this.buildTools();
+    const forced = this.getLlmProviderSetting();
+
+    if (forced === "lightllm") {
+      return dedupeConsecutiveTextDeltas(this.streamFromProvider("lightllm", system, messages, tools));
+    }
+    if (forced === "workers-ai") {
+      return dedupeConsecutiveTextDeltas(this.streamFromProvider("workers-ai", system, messages, tools));
+    }
+
+    // "auto": Workers AI zuerst, bei sofortigem Fehler (z.B. Tageskontingent
+    // aufgebraucht, Fehler 4006) auf LightLLM/Devstral ausweichen. Nur der
+    // ERSTE Stream-Part wird geprüft -- ein Fehler mitten im Turn (nach
+    // bereits gesprochenem Text) wird nicht mehr umgeschaltet, das würde
+    // abgeschnittene/doppelte Sätze riskieren.
+    const primary = this.streamFromProvider("workers-ai", system, messages, tools);
+    const iterator = primary[Symbol.asyncIterator]();
+    let first: Awaited<ReturnType<typeof iterator.next>>;
+    try {
+      first = await iterator.next();
+    } catch (err) {
+      console.error("Workers AI Stream-Start fehlgeschlagen, wechsle zu LightLLM:", err);
+      return dedupeConsecutiveTextDeltas(this.streamFromProvider("lightllm", system, messages, tools));
+    }
+    if (!first.done && isErrorPart(first.value)) {
+      console.error("Workers AI lieferte sofort einen Fehler, wechsle zu LightLLM:", first.value);
+      return dedupeConsecutiveTextDeltas(this.streamFromProvider("lightllm", system, messages, tools));
+    }
+    return dedupeConsecutiveTextDeltas(prependAndContinue(first, iterator));
+  }
+
+  // ---------------------------------------------------------------------
+  // HTTP: öffentliche Verfügbarkeit + Admin-API
+  // ---------------------------------------------------------------------
+
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/^\/agents\/salon-agent\/[^/]+/, "") || "/";
+
+    if (request.method === "GET" && path === "/availability") {
+      return this.handleAvailability(url);
+    }
+    if (request.method === "GET" && path.startsWith("/stt-audio/")) {
+      const id = decodeURIComponent(path.split("/").pop() ?? "");
+      const bytes = this.#pendingSttClips.get(id);
+      if (!bytes) return new Response("Not found", { status: 404 });
+      this.#pendingSttClips.delete(id); // Einmal-Abruf
+      return new Response(bytes, { headers: { "content-type": "audio/wav" } });
+    }
+    if (request.method === "POST" && path === "/admin/login") {
+      return this.handleAdminLogin(request);
+    }
+
+    if (path.startsWith("/admin/")) {
+      const authorized = await this.isAdminRequest(request);
+      if (!authorized) return json({ error: "unauthorized" }, 401);
+
+      if (request.method === "GET" && path === "/admin/appointments") {
+        return this.handleAdminListAppointments();
+      }
+      if (request.method === "DELETE" && path.startsWith("/admin/appointments/")) {
+        const apptId = decodeURIComponent(path.split("/").pop() ?? "");
+        this.sql`UPDATE appointments SET status = 'cancelled' WHERE id = ${apptId}`;
+        return json({ ok: true });
+      }
+      if (request.method === "GET" && path === "/admin/blockers") {
+        return this.handleAdminListBlockers();
+      }
+      if (request.method === "POST" && path === "/admin/blockers") {
+        return this.handleAdminAddBlocker(request);
+      }
+      if (request.method === "DELETE" && path.startsWith("/admin/blockers/")) {
+        const blockerId = decodeURIComponent(path.split("/").pop() ?? "");
+        this.sql`DELETE FROM blockers WHERE id = ${blockerId}`;
+        return json({ ok: true });
+      }
+      if (request.method === "GET" && path === "/admin/settings") {
+        return json({ llmProvider: this.getLlmProviderSetting() });
+      }
+      if (request.method === "POST" && path === "/admin/settings") {
+        const body = (await request.json().catch(() => null)) as { llmProvider?: string } | null;
+        if (body?.llmProvider !== "auto" && body?.llmProvider !== "workers-ai" && body?.llmProvider !== "lightllm") {
+          return json({ error: "invalid_llm_provider" }, 400);
+        }
+        this.setLlmProviderSetting(body.llmProvider);
+        return json({ ok: true, llmProvider: body.llmProvider });
+      }
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+
+  private handleAvailability(url: URL): Response {
+    const now = Date.now();
+    const dateParam = url.searchParams.get("date");
+    const serviceParam = (url.searchParams.get("service") as ServiceKey | null) ?? "schneiden_kurz";
+
+    if (dateParam) {
+      if (!isWithinBookingHorizon(dateParam, now)) {
+        return json({ date: dateParam, closed: false, slots: [] as string[], hinweis: "außerhalb des Buchungszeitraums" });
+      }
+      const dayStartMs = zonedTimeToUtcMs(dateParam, "00:00");
+      const closed = !OPENING_HOURS[weekdayOfDateStr(dateParam)];
+      const slots = closed
+        ? []
+        : getAvailableSlots({
+            dateStr: dateParam,
+            service: serviceParam,
+            appointments: this.appointmentsAround(dayStartMs),
+            blockers: this.blockersAround(dayStartMs),
+            now
+          });
+      return json({
+        date: dateParam,
+        weekday: weekdayNameDe(dateParam),
+        closed,
+        slots: slots.map((s) => toTimeStr(s))
+      });
+    }
+
+    const days = Math.min(Number(url.searchParams.get("days")) || 14, 30);
+    const result = [];
+    for (let i = 0; i < days; i++) {
+      const dayMs = now + i * DAY_MS;
+      const dateStr = toDateStr(dayMs);
+      const closed = !OPENING_HOURS[weekdayOfDateStr(dateStr)];
+      let freeCount = 0;
+      if (!closed) {
+        const dayStartMs = zonedTimeToUtcMs(dateStr, "00:00");
+        freeCount = getAvailableSlots({
+          dateStr,
+          service: serviceParam,
+          appointments: this.appointmentsAround(dayStartMs),
+          blockers: this.blockersAround(dayStartMs),
+          now
+        }).length;
+      }
+      result.push({ date: dateStr, weekday: weekdayNameDe(dateStr), closed, freeCount });
+    }
+    return json(result);
+  }
+
+  private async handleAdminLogin(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as { password?: string } | null;
+    if (!body?.password || body.password !== this.env.ADMIN_PASSWORD) {
+      return json({ error: "invalid_password" }, 401);
+    }
+    const token = newId();
+    const expiresAt = Date.now() + 12 * 3600_000;
+    this.sql`INSERT INTO admin_sessions (token, expires_at) VALUES (${token}, ${expiresAt})`;
+    return json({ token, expiresAt });
+  }
+
+  private async isAdminRequest(request: Request): Promise<boolean> {
+    const auth = request.headers.get("authorization") ?? "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (!token) return false;
+    const rows = this.sql<{ expires_at: number }>`SELECT expires_at FROM admin_sessions WHERE token = ${token}`;
+    return rows.length > 0 && rows[0].expires_at > Date.now();
+  }
+
+  private handleAdminListAppointments(): Response {
+    const from = Date.now() - 7 * DAY_MS;
+    const rows = this.sql<AppointmentRow>`SELECT * FROM appointments WHERE start_ts >= ${from} ORDER BY start_ts ASC LIMIT 300`;
+    const appts = rows.map(rowToAppointment);
+    return json(
+      appts.map((a) => ({
+        id: a.id,
+        name: a.customerName,
+        phone: a.phone,
+        service: SERVICES[a.service].label,
+        date: toDateStr(a.startTs),
+        time: toTimeStr(a.startTs),
+        status: a.status
+      }))
+    );
+  }
+
+  private handleAdminListBlockers(): Response {
+    const from = Date.now() - 7 * DAY_MS;
+    const rows = this.sql<BlockerRow>`SELECT * FROM blockers WHERE end_ts >= ${from} ORDER BY start_ts ASC LIMIT 300`;
+    const blockers = rows.map(rowToBlocker);
+    return json(
+      blockers.map((b) => ({
+        id: b.id,
+        reason: b.reason,
+        startDate: toDateStr(b.startTs),
+        startTime: toTimeStr(b.startTs),
+        endDate: toDateStr(b.endTs),
+        endTime: toTimeStr(b.endTs)
+      }))
+    );
+  }
+
+  private async handleAdminAddBlocker(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as {
+      startDate?: string;
+      startTime?: string;
+      endDate?: string;
+      endTime?: string;
+      reason?: string;
+    } | null;
+    if (!body?.startDate || !body.startTime || !body.endDate || !body.endTime || !body.reason) {
+      return json({ error: "missing_fields" }, 400);
+    }
+    const startTs = zonedTimeToUtcMs(body.startDate, body.startTime);
+    const endTs = zonedTimeToUtcMs(body.endDate, body.endTime);
+    if (endTs <= startTs) return json({ error: "invalid_range" }, 400);
+    const blockerId = newId();
+    this.sql`INSERT INTO blockers (id, start_ts, end_ts, reason, created_at)
+      VALUES (${blockerId}, ${startTs}, ${endTs}, ${body.reason}, ${Date.now()})`;
+    return json({ ok: true, id: blockerId });
+  }
+}

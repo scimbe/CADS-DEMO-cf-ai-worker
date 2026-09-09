@@ -1,0 +1,192 @@
+:root {
+  /* Palette an bunsenbrenner.org angelehnt (dark-first, mit Light-Override) */
+  --bg: #0c111d;
+  --card-bg: #141b2c;
+  --panel2: #1a2338;
+  --border: #2a3450;
+  --line-soft: #212a41;
+  --ink: #eef1f7;
+  --muted: #8a93ad;
+  --muted2: #c3c9db;
+  --accent: #d98a4f;
+  --accent-dark: #a8683a;
+  --accent2: #5fb8ab;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --serif: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  --free: var(--accent2);
+  --full: var(--accent);
+  --closed: var(--muted);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f7fb;
+    --card-bg: #ffffff;
+    --panel2: #eef1f8;
+    --border: #d7deec;
+    --line-soft: #e3e8f3;
+    --ink: #131a2c;
+    --muted: #5b6478;
+    --muted2: #333d54;
+    --accent: #b8672f;
+    --accent-dark: #8f4f24;
+    --accent2: #2f8a7d;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.6;
+}
+
+h1, h2 { font-family: var(--serif); font-weight: 600; letter-spacing: -0.01em; }
+
+.hero {
+  padding: 3rem 1.5rem 2rem;
+  text-align: center;
+  border-bottom: 1px solid var(--border);
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(var(--line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+  background-size: 34px 34px;
+}
+
+.hero h1 { margin: 0 0 0.5rem; font-size: 2rem; }
+.hero p { margin: 0 auto; max-width: 40rem; color: var(--muted); }
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 0 1.5rem 3rem;
+  display: grid;
+  gap: 1.5rem;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.5rem;
+}
+
+.card h2 { margin-top: 0; }
+
+.status { font-weight: 600; color: var(--accent-dark); }
+.call-error {
+  background: var(--panel2);
+  border: 1px solid var(--full);
+  color: var(--full);
+  padding: 0.6rem 0.9rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+
+.voice-controls { display: flex; gap: 0.75rem; margin: 1rem 0; flex-wrap: wrap; }
+
+button {
+  font: inherit;
+  padding: 0.65rem 1.1rem;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { background: var(--border); color: var(--muted); cursor: not-allowed; }
+button:hover:not(:disabled) { background: var(--accent-dark); }
+
+.transcript {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  background: var(--panel2);
+  margin-bottom: 1rem;
+}
+.msg { margin: 0.35rem 0; padding: 0.4rem 0.7rem; border-radius: 8px; max-width: 85%; }
+.msg-user { background: var(--border); margin-left: auto; text-align: right; }
+.msg-assistant { background: var(--card-bg); border: 1px solid var(--border); }
+
+.text-form { display: flex; gap: 0.5rem; }
+.text-form input {
+  flex: 1;
+  padding: 0.6rem 0.8rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  color: var(--ink);
+  font: inherit;
+}
+
+.hours { list-style: none; padding: 0; margin: 0; }
+.hours li { display: flex; justify-content: space-between; padding: 0.35rem 0; border-bottom: 1px dashed var(--border); }
+.hours li:last-child { border-bottom: none; }
+
+.hint { color: var(--muted); margin-top: -0.5rem; }
+
+.steps-details summary { cursor: pointer; }
+.steps-details summary h2 { display: inline; }
+.steps-details .steps { margin-top: 1rem; }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 1rem; }
+.steps li { display: flex; gap: 0.9rem; align-items: flex-start; }
+.steps strong { display: block; margin-bottom: 0.15rem; }
+.steps p { margin: 0; color: var(--muted); }
+.step-num {
+  flex: 0 0 auto;
+  width: 1.8rem;
+  height: 1.8rem;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.9rem;
+  font-family: var(--mono);
+}
+
+.calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 0.5rem;
+}
+.day { border-radius: 8px; padding: 0.5rem 0.4rem; text-align: center; font-size: 0.8rem; border: 1px solid var(--border); background: var(--panel2); }
+.day strong { display: block; font-size: 1rem; font-family: var(--mono); }
+.day span { display: block; color: var(--muted); }
+.day em { display: block; font-style: normal; font-weight: 600; margin-top: 0.2rem; }
+.day-free { border-color: var(--free); }
+.day-free em { color: var(--free); }
+.day-full { border-color: var(--full); }
+.day-full em { color: var(--full); }
+.day-closed { color: var(--closed); }
+.day-closed em { color: var(--closed); }
+
+footer { text-align: center; padding: 1.5rem; color: var(--muted); }
+footer a { color: var(--accent-dark); }
+
+#login-form, .blocker-form { display: grid; gap: 0.75rem; }
+.blocker-form label { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); }
+.blocker-form input, #login-form input {
+  padding: 0.5rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  color: var(--ink);
+  font: inherit;
+}
+.error { color: var(--full); }
+.provider-select { display: grid; gap: 0.25rem; font-size: 0.85rem; color: var(--muted); margin-bottom: 1.25rem; }
+.provider-select select { padding: 0.5rem 0.7rem; border-radius: 8px; border: 1px solid var(--border); background: var(--panel2); color: var(--ink); font: inherit; }
+.list { list-style: none; padding: 0; margin: 1rem 0; display: grid; gap: 0.5rem; }
+.list li { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); }
+.list li.cancelled { opacity: 0.55; text-decoration: line-through; }
+.list li button { padding: 0.35rem 0.8rem; }

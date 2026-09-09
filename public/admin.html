@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Salon Schnittwerk – Verwaltung</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="hero">
+  <h1>Verwaltung</h1>
+  <p>Termine einsehen, absagen und Blocker (Urlaub, Pause, Fortbildung) eintragen.</p>
+</header>
+
+<main>
+  <section class="card" id="login-card">
+    <h2>Anmeldung</h2>
+    <form id="login-form">
+      <input id="password-input" type="password" placeholder="Passwort" required>
+      <button type="submit">Anmelden</button>
+    </form>
+    <p id="login-error" class="error" hidden>Falsches Passwort.</p>
+  </section>
+
+  <section class="card" id="admin-area" hidden>
+    <h2>KI-Anbieter (Text &amp; Sprache)</h2>
+    <p class="hint">"Automatisch" nutzt Cloudflare Workers AI für Text/Terminlogik und wechselt dort bei Fehlern (z.B. aufgebrauchtes Tageskontingent) automatisch zu LightLLM. Die Spracherkennung folgt demselben Schalter, wechselt aber NICHT automatisch (kein Streaming beim Fallback, daher spürbar langsamer) — bei Cloudflare-Ausfall hier manuell auf LightLLM stellen.</p>
+    <label class="provider-select">
+      <span>Anbieter</span>
+      <select id="llm-provider-select">
+        <option value="auto">Automatisch (Text) / Workers AI (Sprache)</option>
+        <option value="workers-ai">Cloudflare Workers AI erzwingen (Text &amp; Sprache)</option>
+        <option value="lightllm">LightLLM erzwingen (Text &amp; Sprache)</option>
+      </select>
+    </label>
+
+    <h2>Neuer Blocker</h2>
+    <form id="blocker-form" class="blocker-form">
+      <label>Von (Datum) <input type="date" id="blocker-start-date" required></label>
+      <label>Von (Uhrzeit) <input type="time" id="blocker-start-time" required value="09:00"></label>
+      <label>Bis (Datum) <input type="date" id="blocker-end-date" required></label>
+      <label>Bis (Uhrzeit) <input type="time" id="blocker-end-time" required value="18:00"></label>
+      <label>Grund <input type="text" id="blocker-reason" placeholder="z.B. Urlaub, Fortbildung" required></label>
+      <button type="submit">Blocker eintragen</button>
+    </form>
+    <ul id="blocker-list" class="list"></ul>
+
+    <h2>Termine</h2>
+    <ul id="appointment-list" class="list"></ul>
+  </section>
+</main>
+
+<footer><a href="/">Zur Startseite</a></footer>
+<script src="/admin.js" defer></script>
+</body>
+</html>

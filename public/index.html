@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Salon Schnittwerk – Termin per Anruf</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="hero">
+  <h1>✂️ Salon Schnittwerk</h1>
+  <p>Rufen Sie unsere digitale Empfangskraft Lea an – sie bucht, verschiebt oder storniert Ihren Termin in einem ganz normalen Gespräch.</p>
+</header>
+
+<main>
+  <section class="card">
+    <details class="steps-details">
+      <summary><h2>So funktioniert's</h2></summary>
+      <ol class="steps">
+        <li><span class="step-num">1</span><div><strong>Anruf starten</strong><p>Auf „📞 Anruf starten" klicken und im Browser den Mikrofonzugriff erlauben.</p></div></li>
+        <li><span class="step-num">2</span><div><strong>Ganz normal sprechen</strong><p>Sagen Sie Lea, was Sie möchten – z. B. „Ich hätte gern einen Termin zum Schneiden, am liebsten Donnerstagnachmittag."</p></div></li>
+        <li><span class="step-num">3</span><div><strong>Termin bestätigen</strong><p>Lea schlägt freie Zeiten vor, bestätigt Ihren Termin und trägt ihn sofort in den Kalender ein.</p></div></li>
+        <li><span class="step-num">4</span><div><strong>Jederzeit ändern</strong><p>Einfach wieder anrufen, um zu verschieben oder abzusagen. Kein Mikrofon zur Hand? Unten geht's auch per Text.</p></div></li>
+      </ol>
+    </details>
+  </section>
+
+  <section class="card voice-card">
+    <h2>Termin per Anruf</h2>
+    <p id="status" class="status" data-status="idle">Bereit für Ihren Anruf</p>
+    <p id="call-error" class="call-error" hidden></p>
+    <div class="voice-controls">
+      <button id="call-btn" type="button">📞 Anruf starten</button>
+      <button id="mute-btn" type="button" disabled>🎤 Stummschalten</button>
+    </div>
+    <div id="transcript" class="transcript" aria-live="polite"></div>
+    <form id="text-form" class="text-form">
+      <input id="text-input" type="text" placeholder="Oder tippen Sie Ihre Nachricht …" autocomplete="off">
+      <button type="submit">Senden</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Wie frei sind wir?</h2>
+    <p class="hint">Ein grober Überblick – die genaue Uhrzeit bespricht Lea am Telefon mit Ihnen.</p>
+    <div id="calendar" class="calendar-grid">Lade Verfügbarkeit …</div>
+  </section>
+
+  <section class="card">
+    <h2>Öffnungszeiten</h2>
+    <ul class="hours">
+      <li><span>Montag</span><span>geschlossen</span></li>
+      <li><span>Dienstag – Freitag</span><span>09:00 – 18:00 Uhr</span></li>
+      <li><span>Samstag</span><span>09:00 – 14:00 Uhr</span></li>
+      <li><span>Sonntag</span><span>geschlossen</span></li>
+    </ul>
+  </section>
+</main>
+
+<footer><a href="/admin.html">Für Mitarbeiter</a></footer>
+
+<script type="module" src="/voice-widget.js"></script>
+<script defer>
+  const grid = document.querySelector('#calendar');
+  fetch('/agents/salon-agent/default/availability?days=14')
+    .then((r) => r.json())
+    .then((days) => {
+      grid.innerHTML = '';
+      for (const day of days) {
+        const el = document.createElement('div');
+        const state = day.closed ? 'closed' : day.freeCount > 0 ? 'free' : 'full';
+        el.className = `day day-${state}`;
+        const [, m, d] = day.date.split('-');
+        const label = day.closed ? 'zu' : day.freeCount > 0 ? day.freeCount + ' frei' : 'voll';
+        el.innerHTML = `<strong>${d}.${m}.</strong><span>${day.weekday.slice(0, 2)}</span><em>${label}</em>`;
+        grid.appendChild(el);
+      }
+    })
+    .catch(() => { grid.textContent = 'Verfügbarkeit konnte nicht geladen werden.'; });
+</script>
+</body>
+</html>

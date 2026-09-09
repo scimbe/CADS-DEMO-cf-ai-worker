@@ -1,0 +1,28 @@
+{
+  "name": "friseur-support-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build:client && wrangler dev",
+    "build:client": "esbuild src/client/voice-widget.ts --bundle --format=esm --outfile=public/voice-widget.js",
+    "deploy": "npm run build:client && wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.client.json"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.46",
+    "@cloudflare/voice": "^0.4.0",
+    "agents": "^0.22.0",
+    "ai": "^7.0.95",
+    "workers-ai-provider": "^4.0.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260908.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.7.3",
+    "vitest": "^5.0.0",
+    "wrangler": "^4.130.0"
+  }
+}

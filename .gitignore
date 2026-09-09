@@ -1,0 +1,20 @@
+# Ruflo local secrets and runtime data
+.env
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+
+# Node / build
+node_modules/
+dist/
+public/voice-widget.js
+public/voice-widget.js.map
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+
+# Misc
+*.log
