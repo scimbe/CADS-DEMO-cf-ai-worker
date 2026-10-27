@@ -38,6 +38,8 @@ export interface ClaimGuard {
   /** Werkzeug, das ein Korrekturversuch erzwingen soll (Standard: das einzige Werkzeug in `tools`). */
   forceTool?: string;
   pattern: RegExp;
+  /** Treffer dieses Musters im Text entkraeften die Pruefung (z.B. Absage-Wortlaut bei Buchungs-Guard). */
+  unless?: RegExp;
   /** Nur fuer "action": Werkzeuge, die die Behauptung belegen koennen. */
   tools?: readonly string[];
   /** Korrekturhinweis an das Modell (nicht an den Gast). */
@@ -53,10 +55,14 @@ interface Evidence {
   unavailableTimes: Set<string>;
   /** Ein Werkzeug hat den Tag/Termin insgesamt als nicht buchbar gemeldet. */
   dayUnavailable: boolean;
+  /** Ein Werkzeug wurde wegen verwechselter Aktion abgelehnt (Gast wollte etwas anderes). */
+  refused: boolean;
+  /** Alle Werkzeugergebnisse dieses Zuges (zum Wiedergeben, falls das Modell keinen Text liefert). */
+  results: Array<{ tool: string; output: Record<string, unknown> }>;
 }
 
 function newEvidence(): Evidence {
-  return { okTools: new Set(), unavailableTimes: new Set(), dayUnavailable: false };
+  return { okTools: new Set(), unavailableTimes: new Set(), dayUnavailable: false, refused: false, results: [] };
 }
 
 function unwrap(output: unknown): Record<string, unknown> | null {
@@ -69,8 +75,10 @@ function unwrap(output: unknown): Record<string, unknown> | null {
 function recordEvidence(ev: Evidence, toolName: string | undefined, output: unknown): void {
   const o = unwrap(output);
   if (!o) return;
+  if (toolName) ev.results.push({ tool: toolName, output: o });
   const status = typeof o.status === "string" ? o.status : undefined;
   if (status && OK_STATUS.has(status) && toolName) ev.okTools.add(toolName);
+  if (status === "abgelehnt") ev.refused = true;
   if (status && DAY_UNAVAILABLE_STATUS.has(status)) ev.dayUnavailable = true;
   const wanted = o.gewuenschte_zeit as { zeit?: unknown; frei?: unknown } | undefined;
   if (wanted && wanted.frei === false && typeof wanted.zeit === "string") ev.unavailableTimes.add(wanted.zeit);
@@ -78,6 +86,7 @@ function recordEvidence(ev: Evidence, toolName: string | undefined, output: unkn
 
 function violated(g: ClaimGuard, text: string, ev: Evidence): boolean {
   if (!g.pattern.test(text)) return false;
+  if (g.unless?.test(text)) return false;
   switch (g.mode ?? "action") {
     case "style":
       return true;
@@ -106,9 +115,8 @@ function pickToolChoice(broken: readonly ClaimGuard[], knownTools: readonly stri
     else for (const t of g.tools ?? []) wanted.add(t);
   }
   const usable = [...wanted].filter((t) => knownTools.includes(t));
-  if (usable.length === 1) return { type: "tool", toolName: usable[0] };
-  if (usable.length > 1) return "required";
-  return undefined;
+  // Das LiteLLM-Backend ignoriert eine benannte Werkzeugwahl (-> ToolChoiceViolationError), "required" geht.
+  return usable.length > 0 ? "required" : undefined;
 }
 
 const DEFAULT_HINT =
@@ -130,6 +138,13 @@ export interface RunTurnOptions {
    * bei anderen Anbietern wuerde das legitime Wiederholungen ("00" in "09:00") zerstoeren.
    */
   doubledDeltaProviders?: readonly string[];
+  /**
+   * Letzte Rettung, wenn das Modell seinen Vertrag bricht (Behauptung ohne Beleg, leer, Fehler):
+   * liefert eine deterministisch erzeugte Antwort oder null.
+   */
+  recover?: () => Promise<string | null>;
+  /** Formuliert ein Werkzeugergebnis (fuer Zuege, in denen das Modell nach einer Aktion keinen Text liefert). */
+  renderResult?: (tool: string, output: Record<string, unknown>) => string | null;
   /** Pruefungen auf nicht belegte Behauptungen und Stilregeln. */
   claimGuards?: readonly ClaimGuard[];
   log?: (msg: string, detail?: unknown) => void;
@@ -159,6 +174,11 @@ async function collect(source: AsyncIterable<StreamPartLike>, doubled: boolean, 
   try {
     for await (const part of source) {
       counts[part.type] = (counts[part.type] ?? 0) + 1;
+      if (part.type === "text-start") {
+        // Neues Textsegment (z.B. nach einem Werkzeugschritt): nie nahtlos an den vorigen Satz kleben.
+        flushRun();
+        if (text && !/\s$/.test(text)) text += " ";
+      }
       if (part.type === "error") {
         flushRun();
         return { text, error: part.error ?? part, nativeToolRan, counts };
@@ -186,7 +206,7 @@ async function collect(source: AsyncIterable<StreamPartLike>, doubled: boolean, 
   return { text, nativeToolRan, counts };
 }
 
-async function executeLeaked(tools: ToolSet, name: string, args: Record<string, unknown>): Promise<unknown> {
+export async function executeLeaked(tools: ToolSet, name: string, args: Record<string, unknown>): Promise<unknown> {
   const t = tools[name] as
     | {
         inputSchema?: { safeParse?: (v: unknown) => { success: boolean; data?: unknown } };
@@ -225,6 +245,27 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
   const toolNames = Object.keys(tools);
   const guards = opts.claimGuards ?? [];
 
+  // Aufgeben ist der letzte Schritt: Hat ein Werkzeug schon etwas bewirkt, wird dessen Ergebnis
+  // wiedergegeben (nie erneut ausgefuehrt). Sonst versucht die deterministische Wiederherstellung.
+  const giveUp = async (fallback: string, ev: Evidence): Promise<string> => {
+    if (ev.okTools.size > 0) {
+      for (const r of [...ev.results].reverse()) {
+        const rendered = opts.renderResult?.(r.tool, r.output);
+        if (rendered) return rendered;
+      }
+      return fallback;
+    }
+    if (opts.recover) {
+      try {
+        const recovered = await opts.recover();
+        if (recovered) return recovered;
+      } catch (err) {
+        log("Wiederherstellung fehlgeschlagen", err);
+      }
+    }
+    return fallback;
+  };
+
   for (const provider of providers) {
     for (let attempt = 1; attempt <= tries; attempt++) {
       const messages = [...opts.messages];
@@ -249,6 +290,11 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
           failed = true;
           break;
         }
+        // Das Modell hat die Aktion verwechselt (Werkzeug abgelehnt) und nichts Passendes bewirkt: sofort retten.
+        if (ev.refused && ev.okTools.size === 0) {
+          log(`Anbieter ${provider}: Aktion verwechselt (abgelehnt) -> Wiederherstellung`);
+          return await giveUp(FALLBACK_SENTENCE, ev);
+        }
         const extracted = extractLeakedToolCalls(res.text, toolNames);
         const text = stripToolNarration(extracted.text);
         const calls = extracted.calls;
@@ -270,7 +316,7 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
             }
             // Stilverstoss allein ist kein Grund, die Antwort zu verwerfen.
             if (broken.every((g) => g.mode === "style")) return finalText;
-            return UNBACKED_SENTENCE;
+            return await giveUp(UNBACKED_SENTENCE, ev);
           }
           log(`Anbieter ${provider}: leere Antwort (Versuch ${attempt}/${tries})`);
           break;
@@ -285,6 +331,10 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
           const result = await executeLeaked(tools, c.name, c.args);
           results.push(result);
           recordEvidence(ev, c.name, result);
+        }
+        if (ev.refused && ev.okTools.size === 0) {
+          log(`Anbieter ${provider}: Aktion verwechselt (abgelehnt) -> Wiederherstellung`);
+          return await giveUp(FALLBACK_SENTENCE, ev);
         }
         messages.push({
           role: "assistant",
@@ -304,11 +354,11 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
       // Hat bereits ein Werkzeug gewirkt (z.B. Buchung), darf nicht erneut versucht
       // und kein anderer Anbieter gefragt werden -- sonst droht doppelte Ausfuehrung.
       if (toolRan) {
-        log(`Anbieter ${provider}: Werkzeug lief, aber kein Antworttext -> Ersatzsatz`);
-        return FALLBACK_SENTENCE;
+        log(`Anbieter ${provider}: Werkzeug lief, aber kein Antworttext`);
+        return await giveUp(FALLBACK_SENTENCE, ev);
       }
       if (failed) break; // direkt zum naechsten Anbieter
     }
   }
-  return FALLBACK_SENTENCE;
+  return await giveUp(FALLBACK_SENTENCE, newEvidence());
 }

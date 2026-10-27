@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractTimes, splitSentences, stripToolNarration } from "../src/lib/text-guards";
+import { extractTimes, intentFromText, splitSentences, stripToolNarration } from "../src/lib/text-guards";
 
 describe("stripToolNarration", () => {
   it("entfernt den gemeldeten Fall (Werkzeug zur Terminabsage)", () => {
@@ -43,5 +43,27 @@ describe("extractTimes", () => {
   });
   it("haelt Datumsangaben nicht fuer Uhrzeiten", () => {
     expect(extractTimes("Am 29.10. ist offen").size).toBe(0);
+  });
+});
+
+describe("intentFromText", () => {
+  it.each([
+    ["Ja, bitte absagen.", "absagen"],
+    ["Bitte sagen Sie meinen Termin ab. Meine Nummer ist 0151.", "absagen"],
+    ["Ich möchte stornieren", "absagen"],
+    ["Ja, bitte buchen.", "buchen"],
+    ["Ich möchte am Mittwoch einen Herrenhaarschnitt buchen.", "buchen"],
+    ["Bitte verschieben Sie meinen Termin", "verschieben"],
+    ["Ich möchte umbuchen", "verschieben"],
+    ["Ja, bitte.", null],
+    ["Vielen Dank, das war alles.", null]
+  ])("liest %s als %s", (text, expected) => {
+    expect(intentFromText(text)).toBe(expected);
+  });
+});
+
+describe("Technik-Erzaehlung mit 'ab'", () => {
+  it("entfernt 'Ich rufe jetzt die Buchung für Sie ab.'", () => {
+    expect(stripToolNarration("Ich rufe jetzt die Buchung für Sie ab. Einen Moment.")).toBe("Einen Moment.");
   });
 });
