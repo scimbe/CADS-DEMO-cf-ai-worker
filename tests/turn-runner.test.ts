@@ -81,9 +81,23 @@ describe("runTurnWithRepair", () => {
     expect(executed.length).toBeLessThanOrEqual(3);
   });
 
-  it("entfernt doppelt gelieferte Text-Deltas (Workers-AI-Eigenheit)", async () => {
+  it("entdoppelt doppelt gelieferte Text-Deltas nur fuer Anbieter mit doubledDeltaProviders", async () => {
     const stream = () => parts(text("Gu"), text("Gu"), text("ten"), text("ten"), text(" Tag"), text(" Tag"));
-    expect(await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [] })).toBe("Guten Tag");
+    const opts = { providers: ["a"], stream, tools: makeTools([]), messages: [] };
+    expect(await runTurnWithRepair({ ...opts, doubledDeltaProviders: ["a"] })).toBe("Guten Tag");
+  });
+
+  it("zerstoert keine echten Wiederholungen: '09:00' bleibt bei normalen Anbietern erhalten", async () => {
+    const stream = () => parts(text("09"), text(":"), text("0"), text("0"), text(" Uhr"));
+    expect(await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [] })).toBe("09:00 Uhr");
+  });
+
+  it("bewahrt echte Wiederholungen auch im doppelt gelieferten Stream (4x '0' -> '00')", async () => {
+    const stream = () =>
+      parts(text("09"), text("09"), text(":"), text(":"), text("0"), text("0"), text("0"), text("0"), text(" Uhr"), text(" Uhr"));
+    expect(
+      await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [], doubledDeltaProviders: ["a"] })
+    ).toBe("09:00 Uhr");
   });
 
   describe("Schutz vor erfundenen Erfolgsmeldungen", () => {

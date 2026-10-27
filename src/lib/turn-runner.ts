@@ -45,6 +45,11 @@ export interface RunTurnOptions {
   triesPerProvider?: number;
   /** Max. Folgeaufrufe nach als Text ausgegebenen Werkzeugaufrufen (Standard 4). */
   maxLeakedRounds?: number;
+  /**
+   * Anbieter, deren Stream jedes Text-Delta doppelt liefert (Workers AI). Nur dort wird entdoppelt;
+   * bei anderen Anbietern wuerde das legitime Wiederholungen ("00" in "09:00") zerstoeren.
+   */
+  doubledDeltaProviders?: readonly string[];
   /** Pruefungen auf nicht belegte Erfolgsmeldungen. */
   claimGuards?: readonly ClaimGuard[];
   log?: (msg: string, detail?: unknown) => void;
@@ -60,23 +65,36 @@ interface Attempt {
   okTools: string[];
 }
 
-async function collect(source: AsyncIterable<StreamPartLike>): Promise<Attempt> {
+async function collect(source: AsyncIterable<StreamPartLike>, doubled: boolean): Promise<Attempt> {
   let text = "";
   let nativeToolRan = false;
   const counts: Record<string, number> = {};
   const okTools: string[] = [];
-  // Workers AI liefert (workers-ai-provider) jedes Text-Delta doppelt. Direkt
-  // aufeinanderfolgende identische Deltas werden daher nur einmal uebernommen.
-  let lastDelta: string | undefined;
+  // Laufweise Entdopplung: Liefert der Anbieter jedes Delta doppelt, besteht ein Lauf aus n
+  // identischen Deltas fuer n/2 echte (auch eine echte Wiederholung "0","0" kommt dann als 4x "0").
+  let runDelta: string | undefined;
+  let runCount = 0;
+  const flushRun = () => {
+    if (runDelta !== undefined) text += runDelta.repeat(doubled ? Math.ceil(runCount / 2) : runCount);
+    runDelta = undefined;
+    runCount = 0;
+  };
   try {
     for await (const part of source) {
       counts[part.type] = (counts[part.type] ?? 0) + 1;
-      if (part.type === "error") return { text, error: part.error ?? part, nativeToolRan, counts, okTools };
+      if (part.type === "error") {
+        flushRun();
+        return { text, error: part.error ?? part, nativeToolRan, counts, okTools };
+      }
       if (part.type === "text-delta" && typeof part.text === "string") {
-        if (part.text !== lastDelta) text += part.text;
-        lastDelta = part.text;
+        if (part.text === runDelta) runCount++;
+        else {
+          flushRun();
+          runDelta = part.text;
+          runCount = 1;
+        }
       } else {
-        lastDelta = undefined;
+        flushRun();
       }
       if (part.type === "tool-result") {
         nativeToolRan = true;
@@ -84,8 +102,10 @@ async function collect(source: AsyncIterable<StreamPartLike>): Promise<Attempt> 
       }
     }
   } catch (error) {
+    flushRun();
     return { text, error, nativeToolRan, counts, okTools };
   }
+  flushRun();
   return { text, nativeToolRan, counts, okTools };
 }
 
@@ -129,7 +149,7 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
       let correctionsLeft = 1;
 
       for (let round = 0; round <= maxRounds; round++) {
-        const res = await collect(stream(provider, messages));
+        const res = await collect(stream(provider, messages), (opts.doubledDeltaProviders ?? []).includes(provider));
         if (res.nativeToolRan) toolRan = true;
         for (const t of res.okTools) okTools.add(t);
         log(`Anbieter ${provider}: Stream-Teile`, res.counts);

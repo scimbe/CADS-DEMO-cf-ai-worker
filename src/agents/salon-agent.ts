@@ -24,10 +24,12 @@ import {
   toTimeStr,
   formatDateHumanDe,
   weekdayNameDe,
-  weekdayOfDateStr
+  weekdayOfDateStr,
+  SLOT_STEP_MIN
 } from "../lib/calendar";
 import { buildSystemPrompt } from "../lib/prompt";
 import { runTurnWithRepair } from "../lib/turn-runner";
+import { summarizeSlots } from "../lib/slots";
 
 // Thorsten/Piper-TTS (über den ct-agent-Bridge-Dienst) liefert WAV, nicht das Default mp3.
 const VoiceAgent = withVoice(Agent, { audioFormat: "wav" });
@@ -240,10 +242,11 @@ export class SalonAgent extends VoiceAgent<Env> {
           if (slots.length === 0) {
             return { status: "keine_freien_slots", wochentag: weekdayNameDe(datum) };
           }
+          // Vollstaendige Liste plus fertiger Satz: das Modell soll Uhrzeiten nicht neu abtippen.
           return {
             status: "ok",
             wochentag: weekdayNameDe(datum),
-            freie_zeiten: slots.slice(0, 8).map((s) => toTimeStr(s))
+            ...summarizeSlots(slots.map((s) => toTimeStr(s)), SLOT_STEP_MIN)
           };
         }
       }),
@@ -382,6 +385,7 @@ export class SalonAgent extends VoiceAgent<Env> {
       stream: (provider, msgs) => this.streamFromProvider(provider as "workers-ai" | "lightllm", system, msgs, tools),
       tools,
       messages,
+      doubledDeltaProviders: ["workers-ai"],
       claimGuards: [
         { pattern: /\bgebucht\b/i, tools: ["termin_buchen"] },
         { pattern: /\b(abgesagt|storniert)\b/i, tools: ["termin_absagen"] },
