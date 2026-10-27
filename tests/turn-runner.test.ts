@@ -346,4 +346,67 @@ describe("Anrede, Werkzeug-Erzaehlung und unbelegte Nicht-frei-Aussagen", () => 
       expect(recover).not.toHaveBeenCalled();
     });
   });
+
+  describe("Fehler im erzwungenen Korrekturversuch", () => {
+    it("wechselt dann NICHT den Anbieter, sondern rettet direkt", async () => {
+      const seenProviders: string[] = [];
+      let n = 0;
+      const stream = (provider: string) => {
+        seenProviders.push(provider);
+        // Runde 1: Behauptung ohne Beleg; Runde 2 (erzwungen): Fehler wie ToolChoiceViolationError.
+        return ++n === 1 ? parts(text("Ihr Termin ist gebucht.")) : parts({ type: "error", error: "ToolChoiceViolationError" });
+      };
+      const recover = vi.fn(async () => "Soll ich verbindlich buchen?");
+      const out = await runTurnWithRepair({
+        providers: ["lightllm", "workers-ai"],
+        stream,
+        tools: {
+          termin_buchen: { inputSchema: z.object({ name: z.string() }), execute: async () => ({ status: "gebucht" }) }
+        } as never,
+        messages: [],
+        claimGuards: [{ pattern: /\bgebucht\b/i, tools: ["termin_buchen"] }],
+        recover
+      });
+      expect(out).toBe("Soll ich verbindlich buchen?");
+      expect(seenProviders).toEqual(["lightllm", "lightllm"]); // workers-ai wurde nie gefragt
+      expect(recover).toHaveBeenCalledTimes(1);
+    });
+
+    it("wechselt weiterhin den Anbieter, wenn der ERSTE Aufruf ausfaellt", async () => {
+      const stream = (provider: string) =>
+        provider === "lightllm" ? parts({ type: "error", error: "down" }) : parts(text("Antwort vom Rueckfall."));
+      const out = await runTurnWithRepair({ providers: ["lightllm", "workers-ai"], stream, tools: makeTools([]), messages: [] });
+      expect(out).toBe("Antwort vom Rueckfall.");
+    });
+  });
+
+  describe("Korrekturversuch muss die behauptete Aktion wirklich belegen", () => {
+    const buchTools = {
+      termin_buchen: { inputSchema: z.object({ name: z.string() }), execute: async () => ({ status: "gebucht" }) }
+    } as never;
+    const guard = [{ pattern: /\bgebucht\b/i, tools: ["termin_buchen"] }];
+
+    it("rettet, wenn der Korrekturversuch nur ein anderes Werkzeug nutzt und harmlos antwortet", async () => {
+      let n = 0;
+      const stream = () =>
+        ++n === 1
+          ? parts(text("Ihr Termin ist gebucht."))
+          : parts({ type: "tool-result", toolName: "pruefe_verfuegbarkeit", output: { status: "ok" } }, text("Am Donnerstag um 11:00 Uhr ist frei."));
+      const recover = vi.fn(async () => "Gebucht per Wiederherstellung.");
+      const out = await runTurnWithRepair({ providers: ["a"], stream, tools: buchTools, messages: [], claimGuards: guard, recover });
+      expect(out).toBe("Gebucht per Wiederherstellung.");
+    });
+
+    it("akzeptiert den Korrekturversuch, wenn die Aktion belegt ist", async () => {
+      let n = 0;
+      const stream = () =>
+        ++n === 1
+          ? parts(text("Ihr Termin ist gebucht."))
+          : parts({ type: "tool-result", toolName: "termin_buchen", output: { status: "gebucht" } }, text("Ihr Termin ist jetzt gebucht."));
+      const recover = vi.fn(async () => "darf nicht gerufen werden");
+      const out = await runTurnWithRepair({ providers: ["a"], stream, tools: buchTools, messages: [], claimGuards: guard, recover });
+      expect(out).toBe("Ihr Termin ist jetzt gebucht.");
+      expect(recover).not.toHaveBeenCalled();
+    });
+  });
 });
