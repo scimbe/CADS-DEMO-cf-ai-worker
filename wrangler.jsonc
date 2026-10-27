@@ -25,6 +25,8 @@
     "AUDIO_BRIDGE_URL": "http://127.0.0.1:58090",
     "LIGHTLLM_BASE_URL": "http://127.0.0.1:4003/v1",
     "LIGHTLLM_MODEL": "local-devstral-small2",
-    "LLM_PROVIDER_ORDER": "lightllm,workers-ai"
+    "LLM_PROVIDER_ORDER": "lightllm,workers-ai",
+    "STT_PROVIDER_ORDER": "whisper,workers-ai",
+    "STT_WHISPER_URL": "http://127.0.0.1:8095"
   }
 }
