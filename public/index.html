@@ -62,7 +62,8 @@
 <script type="module" src="/voice-widget.js"></script>
 <script defer>
   const grid = document.querySelector('#calendar');
-  fetch('/agents/salon-agent/default/availability?days=14')
+  function loadAvailability() {
+  fetch('/agents/salon-agent/default/availability?days=14', { cache: 'no-store' })
     .then((r) => r.json())
     .then((days) => {
       grid.innerHTML = '';
@@ -77,6 +78,10 @@
       }
     })
     .catch(() => { grid.textContent = 'Verfügbarkeit konnte nicht geladen werden.'; });
+  }
+  loadAvailability();
+  // Nach Buchung/Absage/Verschiebung im Gespraech sofort aktualisieren.
+  window.addEventListener('availability-changed', loadAvailability);
 </script>
 </body>
 </html>

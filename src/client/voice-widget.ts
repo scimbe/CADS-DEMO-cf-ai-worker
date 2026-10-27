@@ -46,6 +46,12 @@ function initVoiceWidget() {
   client.addEventListener("statuschange", render);
   client.addEventListener("mutechange", render);
   client.addEventListener("transcriptchange", renderTranscript);
+  // Der Server meldet nach Buchung/Absage/Verschiebung eine Aenderung: Seite soll die Uebersicht neu laden.
+  client.addEventListener("custommessage", (msg: unknown) => {
+    if ((msg as { type?: string } | null)?.type === "availability_changed") {
+      window.dispatchEvent(new CustomEvent("availability-changed"));
+    }
+  });
   const friendlyError = (message: string): string => {
     if (/neuron|quota|kontingent|4006/i.test(message)) {
       return "Der Sprachassistent ist gerade ausgelastet (KI-Kontingent für heute aufgebraucht). Bitte versuchen Sie es später erneut.";

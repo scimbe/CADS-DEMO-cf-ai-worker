@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { padTime, summarizeSlots } from "../src/lib/slots";
+import { checkRequestedTime, padTime, parseUhrzeit, summarizeSlots } from "../src/lib/slots";
 
 describe("padTime", () => {
   it("polstert Stunden und Minuten mit Nullen", () => {
@@ -39,5 +39,48 @@ describe("summarizeSlots", () => {
     const r = summarizeSlots([], 15);
     expect(r.freie_zeiten).toEqual([]);
     expect(r.antwort_text).toBe("Es sind keine freien Zeiten vorhanden.");
+  });
+});
+
+describe("parseUhrzeit", () => {
+  it.each([
+    ["10", "10:00"],
+    ["10 Uhr", "10:00"],
+    ["10:00", "10:00"],
+    ["10.30 Uhr", "10:30"],
+    ["9h", "09:00"],
+    ["9:5", "09:05"],
+    [" 14 uhr ", "14:00"]
+  ])("liest %s als %s", (input, expected) => {
+    expect(parseUhrzeit(input)).toBe(expected);
+  });
+
+  it("lehnt Unlesbares und Ungueltiges ab", () => {
+    expect(parseUhrzeit("morgens")).toBeNull();
+    expect(parseUhrzeit("25 Uhr")).toBeNull();
+    expect(parseUhrzeit("10:75")).toBeNull();
+    expect(parseUhrzeit(undefined)).toBeNull();
+    expect(parseUhrzeit("")).toBeNull();
+  });
+});
+
+describe("checkRequestedTime", () => {
+  const free = ["09:00", "09:15", "10:00", "10:15", "11:00"];
+
+  it("meldet eine freie Zeit als frei (10 Uhr bei 35/35 frei)", () => {
+    const r = checkRequestedTime("10:00", free);
+    expect(r.frei).toBe(true);
+    expect(r.antwort_text).toBe("10:00 Uhr ist frei.");
+  });
+
+  it("meldet eine nicht freie Zeit mit den naechsten Alternativen", () => {
+    const r = checkRequestedTime("10:30", free);
+    expect(r.frei).toBe(false);
+    expect(r.naechste_freie_zeiten).toEqual(["10:00", "10:15", "11:00"]);
+    expect(r.antwort_text).toContain("10:30 Uhr ist nicht frei.");
+  });
+
+  it("polstert die angefragte Zeit", () => {
+    expect(checkRequestedTime("9:0", free).frei).toBe(true);
   });
 });
