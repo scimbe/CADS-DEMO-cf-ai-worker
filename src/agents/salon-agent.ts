@@ -32,6 +32,7 @@ import { runTurnWithRepair, executeLeaked, type StreamOptions } from "../lib/tur
 import { recoverTurn, renderToolOutput, parseExtraction, transcriptFrom, EXTRACT_SYSTEM, type Extracted } from "../lib/recovery";
 import { longDateDe } from "../lib/dates-de";
 import { intentFromText, type Intent } from "../lib/text-guards";
+import { describeProviderOrder, parseProviderOrder, resolveProviders } from "../lib/provider-order";
 import { summarizeSlots, parseUhrzeit, checkRequestedTime } from "../lib/slots";
 
 // Thorsten/Piper-TTS (über den ct-agent-Bridge-Dienst) liefert WAV, nicht das Default mp3.
@@ -147,6 +148,12 @@ export class SalonAgent extends VoiceAgent<Env> {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     )`;
+    const order = parseProviderOrder(this.env.LLM_PROVIDER_ORDER);
+    console.log(
+      `[config] LLM-Anbieter: ${describeProviderOrder(this.getLlmProviderSetting(), order)}; ` +
+        `LiteLLM ${this.env.LIGHTLLM_BASE_URL} Modell ${this.env.LIGHTLLM_MODEL || LIGHTLLM_MODEL_ID}; ` +
+        `Workers AI Modell ${this.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL}`
+    );
   }
 
   private getLlmProviderSetting(): LlmProviderName {
@@ -193,7 +200,7 @@ export class SalonAgent extends VoiceAgent<Env> {
         name: "lightllm",
         baseURL: this.env.LIGHTLLM_BASE_URL,
         apiKey: this.env.LIGHTLLM_API_KEY
-      })(LIGHTLLM_MODEL_ID);
+      })(this.env.LIGHTLLM_MODEL || LIGHTLLM_MODEL_ID);
       const { text } = await generateText({
         model,
         system: EXTRACT_SYSTEM,
@@ -439,7 +446,7 @@ export class SalonAgent extends VoiceAgent<Env> {
             name: "lightllm",
             baseURL: this.env.LIGHTLLM_BASE_URL,
             apiKey: this.env.LIGHTLLM_API_KEY
-          })(LIGHTLLM_MODEL_ID);
+          })(this.env.LIGHTLLM_MODEL || LIGHTLLM_MODEL_ID);
     const result = streamText({
       model,
       system,
@@ -461,11 +468,10 @@ export class SalonAgent extends VoiceAgent<Env> {
     this.lastUserText = transcript;
     const tools = this.buildTools();
     const forced = this.getLlmProviderSetting();
-    // "auto": Workers AI zuerst, bei Fehler (z.B. Tageskontingent aufgebraucht,
-    // 4006) auf LightLLM ausweichen. Werkzeugaufrufe, die ein Modell als JSON-Text
+    // "auto": Reihenfolge aus LLM_PROVIDER_ORDER (Standard: LiteLLM zuerst, Workers AI als Rueckfall). Werkzeugaufrufe, die ein Modell als JSON-Text
     // ausgibt, werden erkannt und ausgefuehrt; leere Antworten werden wiederholt und
     // enden notfalls in einem freundlichen Ersatzsatz (siehe lib/turn-runner.ts).
-    const providers: Array<"workers-ai" | "lightllm"> = forced === "auto" ? ["workers-ai", "lightllm"] : [forced];
+    const providers = resolveProviders(forced, parseProviderOrder(this.env.LLM_PROVIDER_ORDER));
     const text = await runTurnWithRepair({
       providers,
       stream: (provider, msgs, options) =>

@@ -275,6 +275,8 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
       let failed = false;
       let correctionsLeft = 1;
       let nextChoice: ToolChoiceOption | undefined;
+      // Aktionen, die das Modell behauptet hat und die nach dem Korrekturversuch belegt sein MUESSEN.
+      let owed: ClaimGuard[] = [];
 
       for (let round = 0; round <= maxRounds; round++) {
         const res = await collect(
@@ -282,11 +284,15 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
           (opts.doubledDeltaProviders ?? []).includes(provider),
           ev
         );
+        const forcedThisRound = nextChoice !== undefined;
         nextChoice = undefined;
         if (res.nativeToolRan) toolRan = true;
         log(`Anbieter ${provider}: Stream-Teile`, res.counts);
         if (res.error) {
           log(`Anbieter ${provider} lieferte einen Fehler`, res.error);
+          // Ignoriert das Modell einen erzwungenen Werkzeugaufruf, ist das kein Ausfall des Anbieters:
+          // kein Anbieterwechsel (verbraucht Kontingent, bringt nichts), sondern direkt die Wiederherstellung.
+          if (forcedThisRound) return await giveUp(FALLBACK_SENTENCE, ev);
           failed = true;
           break;
         }
@@ -302,11 +308,21 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
           const finalText = text || lastClean;
           if (finalText) {
             const broken = guards.filter((g) => violated(g, finalText, ev));
-            if (broken.length === 0) return finalText;
+            if (broken.length === 0) {
+              // Der Korrekturversuch darf nicht mit einem harmlos klingenden Text enden, ohne dass die
+              // behauptete Aktion wirklich stattfand (z.B. "required" waehlte nur die Verfuegbarkeitspruefung).
+              const unmet = owed.some((g) => !(g.tools ?? []).some((t) => ev.okTools.has(t)));
+              if (unmet) {
+                log(`Anbieter ${provider}: behauptete Aktion nach Korrektur weiterhin nicht belegt -> Wiederherstellung`);
+                return await giveUp(UNBACKED_SENTENCE, ev);
+              }
+              return finalText;
+            }
             log(`Anbieter ${provider}: Behauptung/Stil ohne Beleg`, finalText.slice(0, 120));
             if (correctionsLeft > 0 && round < maxRounds) {
               correctionsLeft--;
               nextChoice = pickToolChoice(broken, toolNames);
+              owed = broken.filter((g) => (g.mode ?? "action") === "action");
               messages.push({ role: "assistant", content: finalText });
               messages.push({
                 role: "user",
