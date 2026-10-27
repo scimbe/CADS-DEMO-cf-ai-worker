@@ -1,5 +1,6 @@
 import type { ToolSet } from "ai";
 import { extractLeakedToolCalls } from "./leaked-tool-calls";
+import { extractTimes, splitSentences, stripToolNarration } from "./text-guards";
 
 export const FALLBACK_SENTENCE =
   "Entschuldigung, da habe ich gerade nicht richtig mitgekommen. Könnten Sie das bitte noch einmal sagen?";
@@ -16,29 +17,108 @@ export interface StreamPartLike {
 }
 
 /**
- * Schutz vor erfundenen Erfolgsmeldungen: Behauptet die Antwort eine Aktion
- * (z.B. "gebucht"), muss im selben Zug ein passendes Werkzeug erfolgreich gelaufen sein.
+ * Schutz vor Behauptungen ohne Beleg im selben Zug.
+ *  - "action" (Standard): Erfolgsmeldung ("gebucht") nur, wenn eines der `tools` erfolgreich lief.
+ *  - "unavailable": "vergeben/nicht frei" nur, wenn ein Werkzeug genau diese Uhrzeit als nicht frei
+ *    meldete (oder den ganzen Tag als nicht buchbar). Nennt der Satz keine Uhrzeit, genuegt irgendeine
+ *    Nicht-frei-Meldung.
+ *  - "style": Stilregel (z.B. Anrede "Sie"); ein Korrekturversuch, danach wird der Text trotzdem geliefert.
  */
+export type GuardMode = "action" | "unavailable" | "style";
+
+export type ToolChoiceOption = "required" | { type: "tool"; toolName: string };
+
+export interface StreamOptions {
+  /** Erzwingt im ERSTEN Schritt dieses Aufrufs einen Werkzeugaufruf (nur bei Korrekturversuchen). */
+  toolChoice?: ToolChoiceOption;
+}
+
 export interface ClaimGuard {
+  mode?: GuardMode;
+  /** Werkzeug, das ein Korrekturversuch erzwingen soll (Standard: das einzige Werkzeug in `tools`). */
+  forceTool?: string;
   pattern: RegExp;
-  /** Werkzeuge, die die Behauptung belegen koennen. */
-  tools: readonly string[];
+  /** Nur fuer "action": Werkzeuge, die die Behauptung belegen koennen. */
+  tools?: readonly string[];
+  /** Korrekturhinweis an das Modell (nicht an den Gast). */
+  hint?: string;
 }
 
 const OK_STATUS = new Set(["gebucht", "abgesagt", "verschoben"]);
+const DAY_UNAVAILABLE_STATUS = new Set(["keine_freien_slots", "zu_weit_in_zukunft", "zu_kurzfristig", "belegt"]);
 
-function okStatus(output: unknown): boolean {
-  if (typeof output !== "object" || output === null) return false;
-  const o = output as { status?: unknown; value?: { status?: unknown } };
-  const status = o.status ?? o.value?.status;
-  return typeof status === "string" && OK_STATUS.has(status);
+interface Evidence {
+  okTools: Set<string>;
+  /** Uhrzeiten (HH:MM), die ein Werkzeug als nicht frei gemeldet hat. */
+  unavailableTimes: Set<string>;
+  /** Ein Werkzeug hat den Tag/Termin insgesamt als nicht buchbar gemeldet. */
+  dayUnavailable: boolean;
 }
+
+function newEvidence(): Evidence {
+  return { okTools: new Set(), unavailableTimes: new Set(), dayUnavailable: false };
+}
+
+function unwrap(output: unknown): Record<string, unknown> | null {
+  if (typeof output !== "object" || output === null) return null;
+  const o = output as Record<string, unknown>;
+  if (o.type === "json" && typeof o.value === "object" && o.value !== null) return o.value as Record<string, unknown>;
+  return o;
+}
+
+function recordEvidence(ev: Evidence, toolName: string | undefined, output: unknown): void {
+  const o = unwrap(output);
+  if (!o) return;
+  const status = typeof o.status === "string" ? o.status : undefined;
+  if (status && OK_STATUS.has(status) && toolName) ev.okTools.add(toolName);
+  if (status && DAY_UNAVAILABLE_STATUS.has(status)) ev.dayUnavailable = true;
+  const wanted = o.gewuenschte_zeit as { zeit?: unknown; frei?: unknown } | undefined;
+  if (wanted && wanted.frei === false && typeof wanted.zeit === "string") ev.unavailableTimes.add(wanted.zeit);
+}
+
+function violated(g: ClaimGuard, text: string, ev: Evidence): boolean {
+  if (!g.pattern.test(text)) return false;
+  switch (g.mode ?? "action") {
+    case "style":
+      return true;
+    case "action":
+      return !(g.tools ?? []).some((t) => ev.okTools.has(t));
+    case "unavailable": {
+      if (ev.dayUnavailable) return false;
+      for (const sentence of splitSentences(text).filter((s) => g.pattern.test(s))) {
+        const times = extractTimes(sentence);
+        if (times.size === 0) {
+          if (ev.unavailableTimes.size === 0) return true;
+        } else {
+          for (const t of times) if (!ev.unavailableTimes.has(t)) return true;
+        }
+      }
+      return false;
+    }
+  }
+}
+
+function pickToolChoice(broken: readonly ClaimGuard[], knownTools: readonly string[]): ToolChoiceOption | undefined {
+  const wanted = new Set<string>();
+  for (const g of broken) {
+    if (g.mode === "style") continue;
+    if (g.forceTool) wanted.add(g.forceTool);
+    else for (const t of g.tools ?? []) wanted.add(t);
+  }
+  const usable = [...wanted].filter((t) => knownTools.includes(t));
+  if (usable.length === 1) return { type: "tool", toolName: usable[0] };
+  if (usable.length > 1) return "required";
+  return undefined;
+}
+
+const DEFAULT_HINT =
+  "[Systemhinweis, nicht vom Gast] Du hast eine Buchung, Absage oder Verschiebung bestaetigt, ohne das passende Werkzeug aufzurufen. Rufe jetzt das passende Werkzeug auf und bestaetige erst nach dessen Ergebnis. Falls du gar nichts ausfuehren wolltest, antworte ohne Erfolgsmeldung.";
 
 export interface RunTurnOptions {
   /** Reihenfolge der Anbieter, z.B. ["workers-ai", "lightllm"]. */
   providers: readonly string[];
   /** Startet einen Modellaufruf (inkl. nativer Tool-Schleife) fuer den Anbieter. */
-  stream: (provider: string, messages: unknown[]) => AsyncIterable<StreamPartLike>;
+  stream: (provider: string, messages: unknown[], options?: StreamOptions) => AsyncIterable<StreamPartLike>;
   tools: ToolSet;
   messages: unknown[];
   /** Versuche pro Anbieter bei leerer Antwort (Standard 2). */
@@ -50,7 +130,7 @@ export interface RunTurnOptions {
    * bei anderen Anbietern wuerde das legitime Wiederholungen ("00" in "09:00") zerstoeren.
    */
   doubledDeltaProviders?: readonly string[];
-  /** Pruefungen auf nicht belegte Erfolgsmeldungen. */
+  /** Pruefungen auf nicht belegte Behauptungen und Stilregeln. */
   claimGuards?: readonly ClaimGuard[];
   log?: (msg: string, detail?: unknown) => void;
 }
@@ -61,15 +141,12 @@ interface Attempt {
   nativeToolRan: boolean;
   /** Anzahl je Stream-Part-Typ (Diagnose). */
   counts: Record<string, number>;
-  /** Werkzeuge, die in diesem Aufruf erfolgreich gelaufen sind. */
-  okTools: string[];
 }
 
-async function collect(source: AsyncIterable<StreamPartLike>, doubled: boolean): Promise<Attempt> {
+async function collect(source: AsyncIterable<StreamPartLike>, doubled: boolean, ev: Evidence): Promise<Attempt> {
   let text = "";
   let nativeToolRan = false;
   const counts: Record<string, number> = {};
-  const okTools: string[] = [];
   // Laufweise Entdopplung: Liefert der Anbieter jedes Delta doppelt, besteht ein Lauf aus n
   // identischen Deltas fuer n/2 echte (auch eine echte Wiederholung "0","0" kommt dann als 4x "0").
   let runDelta: string | undefined;
@@ -84,7 +161,7 @@ async function collect(source: AsyncIterable<StreamPartLike>, doubled: boolean):
       counts[part.type] = (counts[part.type] ?? 0) + 1;
       if (part.type === "error") {
         flushRun();
-        return { text, error: part.error ?? part, nativeToolRan, counts, okTools };
+        return { text, error: part.error ?? part, nativeToolRan, counts };
       }
       if (part.type === "text-delta" && typeof part.text === "string") {
         if (part.text === runDelta) runCount++;
@@ -98,19 +175,24 @@ async function collect(source: AsyncIterable<StreamPartLike>, doubled: boolean):
       }
       if (part.type === "tool-result") {
         nativeToolRan = true;
-        if (part.toolName && okStatus(part.output)) okTools.push(part.toolName);
+        recordEvidence(ev, part.toolName, part.output);
       }
     }
   } catch (error) {
     flushRun();
-    return { text, error, nativeToolRan, counts, okTools };
+    return { text, error, nativeToolRan, counts };
   }
   flushRun();
-  return { text, nativeToolRan, counts, okTools };
+  return { text, nativeToolRan, counts };
 }
 
 async function executeLeaked(tools: ToolSet, name: string, args: Record<string, unknown>): Promise<unknown> {
-  const t = tools[name] as { inputSchema?: { safeParse?: (v: unknown) => { success: boolean; data?: unknown } }; execute?: (a: unknown, o: unknown) => Promise<unknown> | unknown } | undefined;
+  const t = tools[name] as
+    | {
+        inputSchema?: { safeParse?: (v: unknown) => { success: boolean; data?: unknown } };
+        execute?: (a: unknown, o: unknown) => Promise<unknown> | unknown;
+      }
+    | undefined;
   if (!t?.execute) return { status: "unbekanntes_werkzeug" };
   let input: unknown = args;
   const schema = t.inputSchema;
@@ -129,8 +211,11 @@ async function executeLeaked(tools: ToolSet, name: string, args: Record<string, 
 /**
  * Fuehrt einen Gespraechszug robust aus und liefert den bereinigten Antworttext.
  *  - Als JSON-Text ausgegebene Werkzeugaufrufe werden erkannt, ausgefuehrt und nie angezeigt.
+ *  - Saetze, die Werkzeuge/Technik erwaehnen, werden entfernt.
  *  - Leere Antworten loesen einen erneuten Versuch aus (nur wenn kein Werkzeug lief).
  *  - Bei Fehlern wird zum naechsten Anbieter gewechselt (nur wenn kein Werkzeug lief).
+ *  - Behauptungen (gebucht / vergeben) brauchen einen Beleg im selben Zug; Stilregeln (Anrede) werden
+ *    mit einem Korrekturversuch durchgesetzt.
  *  - Am Ende steht ein freundlicher Ersatzsatz statt Stille oder Fehlermeldung.
  */
 export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
@@ -138,45 +223,53 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
   const tries = opts.triesPerProvider ?? 2;
   const maxRounds = opts.maxLeakedRounds ?? 4;
   const toolNames = Object.keys(tools);
+  const guards = opts.claimGuards ?? [];
 
   for (const provider of providers) {
     for (let attempt = 1; attempt <= tries; attempt++) {
       const messages = [...opts.messages];
+      const ev = newEvidence();
       let lastClean = "";
       let toolRan = false;
       let failed = false;
-      const okTools = new Set<string>();
       let correctionsLeft = 1;
+      let nextChoice: ToolChoiceOption | undefined;
 
       for (let round = 0; round <= maxRounds; round++) {
-        const res = await collect(stream(provider, messages), (opts.doubledDeltaProviders ?? []).includes(provider));
+        const res = await collect(
+          stream(provider, messages, nextChoice ? { toolChoice: nextChoice } : undefined),
+          (opts.doubledDeltaProviders ?? []).includes(provider),
+          ev
+        );
+        nextChoice = undefined;
         if (res.nativeToolRan) toolRan = true;
-        for (const t of res.okTools) okTools.add(t);
         log(`Anbieter ${provider}: Stream-Teile`, res.counts);
         if (res.error) {
           log(`Anbieter ${provider} lieferte einen Fehler`, res.error);
           failed = true;
           break;
         }
-        const { text, calls } = extractLeakedToolCalls(res.text, toolNames);
+        const extracted = extractLeakedToolCalls(res.text, toolNames);
+        const text = stripToolNarration(extracted.text);
+        const calls = extracted.calls;
         if (calls.length === 0) {
           const finalText = text || lastClean;
           if (finalText) {
-            const unbacked = (opts.claimGuards ?? []).find(
-              (g) => g.pattern.test(finalText) && !g.tools.some((t) => okTools.has(t))
-            );
-            if (!unbacked) return finalText;
-            log(`Anbieter ${provider}: Erfolgsmeldung ohne Werkzeugaufruf`, finalText.slice(0, 120));
+            const broken = guards.filter((g) => violated(g, finalText, ev));
+            if (broken.length === 0) return finalText;
+            log(`Anbieter ${provider}: Behauptung/Stil ohne Beleg`, finalText.slice(0, 120));
             if (correctionsLeft > 0 && round < maxRounds) {
               correctionsLeft--;
+              nextChoice = pickToolChoice(broken, toolNames);
               messages.push({ role: "assistant", content: finalText });
               messages.push({
                 role: "user",
-                content:
-                  "[Systemhinweis, nicht vom Gast] Du hast eine Buchung, Absage oder Verschiebung bestaetigt, ohne das passende Werkzeug aufzurufen. Rufe jetzt das passende Werkzeug auf und bestaetige erst nach dessen Ergebnis. Falls du gar nichts ausfuehren wolltest, antworte ohne Erfolgsmeldung."
+                content: broken.map((g) => g.hint ?? DEFAULT_HINT).join(" ")
               });
               continue;
             }
+            // Stilverstoss allein ist kein Grund, die Antwort zu verwerfen.
+            if (broken.every((g) => g.mode === "style")) return finalText;
             return UNBACKED_SENTENCE;
           }
           log(`Anbieter ${provider}: leere Antwort (Versuch ${attempt}/${tries})`);
@@ -191,7 +284,7 @@ export async function runTurnWithRepair(opts: RunTurnOptions): Promise<string> {
         for (const c of toolCalls) {
           const result = await executeLeaked(tools, c.name, c.args);
           results.push(result);
-          if (okStatus(result)) okTools.add(c.name);
+          recordEvidence(ev, c.name, result);
         }
         messages.push({
           role: "assistant",

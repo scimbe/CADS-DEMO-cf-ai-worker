@@ -42,3 +42,38 @@ export function summarizeSlots(times: readonly string[], stepMin: number): SlotS
       : `Als Startzeit frei (alle ${stepMin} Minuten): ${windows.join(", ")}.`;
   return { freie_zeiten: sorted, zeitfenster: windows, antwort_text };
 }
+
+/** Liest "10", "10 Uhr", "10:30", "10.30 Uhr", "9h" als "HH:MM". Gibt null zurueck, wenn nicht lesbar. */
+export function parseUhrzeit(input: string | undefined | null): string | null {
+  if (!input) return null;
+  const s = input.trim().toLowerCase().replace(/\buhr\b/g, "").replace(/(?<=\d)h\b/g, "").trim();
+  const m = /^(\d{1,2})(?:[:.\s](\d{1,2}))?$/.exec(s);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = m[2] === undefined ? 0 : Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
+
+export interface RequestedTimeCheck {
+  zeit: string;
+  frei: boolean;
+  naechste_freie_zeiten: string[];
+  antwort_text: string;
+}
+
+/** Prueft eine konkret gewuenschte Startzeit gegen die vollstaendige Liste freier Startzeiten. */
+export function checkRequestedTime(requested: string, freeTimes: readonly string[]): RequestedTimeCheck {
+  const zeit = padTime(requested);
+  const free = freeTimes.map(padTime);
+  if (free.includes(zeit)) {
+    return { zeit, frei: true, naechste_freie_zeiten: [], antwort_text: `${zeit} Uhr ist frei.` };
+  }
+  const target = toMinutes(zeit);
+  const nearest = [...free]
+    .sort((a, b) => Math.abs(toMinutes(a) - target) - Math.abs(toMinutes(b) - target))
+    .slice(0, 3)
+    .sort((a, b) => toMinutes(a) - toMinutes(b));
+  const alt = nearest.length > 0 ? ` Naechste freie Zeiten: ${nearest.map((t) => `${t} Uhr`).join(", ")}.` : "";
+  return { zeit, frei: false, naechste_freie_zeiten: nearest, antwort_text: `${zeit} Uhr ist nicht frei.${alt}` };
+}

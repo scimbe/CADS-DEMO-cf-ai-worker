@@ -148,3 +148,108 @@ describe("runTurnWithRepair", () => {
     });
   });
 });
+
+describe("Anrede, Werkzeug-Erzaehlung und unbelegte Nicht-frei-Aussagen", () => {
+  const DU = /\b(du|dir|dich|dein|deine|deinen|deinem|deiner|deines)\b/i;
+  const UNAVAIL =
+    /\b(vergeben|belegt|ausgebucht|besetzt)\b|\bnicht\s+(mehr\s+)?(frei|verf[uü]gbar)\b|\bnichts\s+(mehr\s+)?frei\b/i;
+  const guards = [
+    { mode: "unavailable" as const, pattern: UNAVAIL },
+    { mode: "style" as const, pattern: DU }
+  ];
+  const tools = makeTools([]);
+
+  it("erzwingt die Sie-Anrede mit einem Korrekturversuch", async () => {
+    let n = 0;
+    const stream = () => (++n === 1 ? parts(text("Dein Termin ist bestätigt.")) : parts(text("Ihr Termin ist bestätigt.")));
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: guards });
+    expect(out).toBe("Ihr Termin ist bestätigt.");
+    expect(n).toBe(2);
+  });
+
+  it("liefert den Text auch dann, wenn das Duzen trotz Korrektur bleibt (nur Stil)", async () => {
+    const stream = () => parts(text("Dein Termin ist bestätigt."));
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: guards });
+    expect(out).toBe("Dein Termin ist bestätigt.");
+  });
+
+  it("entfernt Werkzeug-Erzaehlung aus der Antwort", async () => {
+    const stream = () => parts(text("Ich rufe jetzt das Werkzeug zur Terminabsage auf. Ihr Termin wurde abgesagt."));
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: [] });
+    expect(out).toBe("Ihr Termin wurde abgesagt.");
+  });
+
+  it("lehnt 'vergeben' ab, wenn das Werkzeug die Zeit als FREI meldete (Fall Mittwoch 10 Uhr)", async () => {
+    let n = 0;
+    const freeResult: StreamPartLike = {
+      type: "tool-result",
+      toolName: "pruefe_verfuegbarkeit",
+      output: { status: "ok", gewuenschte_zeit: { zeit: "10:00", frei: true } }
+    };
+    const stream = () =>
+      ++n === 1
+        ? parts(freeResult, text("10:00 Uhr ist leider schon vergeben."))
+        : parts(freeResult, text("Mittwoch um 10:00 Uhr ist noch frei."));
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: guards });
+    expect(out).toBe("Mittwoch um 10:00 Uhr ist noch frei.");
+  });
+
+  it("lehnt 'vergeben' ohne jede Pruefung ab und liefert nie die falsche Aussage", async () => {
+    const stream = () => parts(text("10:00 Uhr ist leider schon vergeben."));
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: guards });
+    expect(out).toBe(UNBACKED_SENTENCE);
+  });
+
+  it("erlaubt 'vergeben', wenn das Werkzeug genau diese Zeit als nicht frei meldete", async () => {
+    const stream = () =>
+      parts(
+        { type: "tool-result", toolName: "pruefe_verfuegbarkeit", output: { status: "ok", gewuenschte_zeit: { zeit: "10:00", frei: false } } },
+        text("10:00 Uhr ist leider schon vergeben. Ich hätte 10:15 Uhr.")
+      );
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: guards });
+    expect(out).toBe("10:00 Uhr ist leider schon vergeben. Ich hätte 10:15 Uhr.");
+  });
+
+  it("lehnt 'vergeben' fuer eine ANDERE Uhrzeit als die gemeldete ab", async () => {
+    const stream = () =>
+      parts(
+        { type: "tool-result", toolName: "pruefe_verfuegbarkeit", output: { status: "ok", gewuenschte_zeit: { zeit: "10:30", frei: false } } },
+        text("10:00 Uhr ist leider vergeben.")
+      );
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: guards });
+    expect(out).toBe(UNBACKED_SENTENCE);
+  });
+
+  it("erlaubt 'nichts frei', wenn der Tag als ausgebucht gemeldet wurde", async () => {
+    const stream = () =>
+      parts(
+        { type: "tool-result", toolName: "pruefe_verfuegbarkeit", output: { status: "keine_freien_slots" } },
+        text("Am Montag ist leider nichts mehr frei.")
+      );
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: guards });
+    expect(out).toBe("Am Montag ist leider nichts mehr frei.");
+  });
+
+  it("erzwingt beim Korrekturversuch genau das belegende Werkzeug (toolChoice im ersten Schritt)", async () => {
+    const seen: Array<unknown> = [];
+    let n = 0;
+    const stream = (_p: string, _m: unknown[], options?: { toolChoice?: unknown }) => {
+      seen.push(options?.toolChoice);
+      return ++n === 1
+        ? parts(text("Ihr Termin wurde abgesagt."))
+        : parts({ type: "tool-result", toolName: "termin_absagen", output: { status: "abgesagt" } }, text("Ihr Termin wurde abgesagt."));
+    };
+    const absagenTools = {
+      termin_absagen: { inputSchema: z.object({ telefon: z.string() }), execute: async () => ({ status: "abgesagt" }) }
+    } as never;
+    const out = await runTurnWithRepair({
+      providers: ["a"],
+      stream,
+      tools: absagenTools,
+      messages: [],
+      claimGuards: [{ pattern: /\b(abgesagt|storniert)\b/i, tools: ["termin_absagen"] }]
+    });
+    expect(out).toBe("Ihr Termin wurde abgesagt.");
+    expect(seen).toEqual([undefined, { type: "tool", toolName: "termin_absagen" }]);
+  });
+});

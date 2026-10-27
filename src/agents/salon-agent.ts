@@ -28,8 +28,8 @@ import {
   SLOT_STEP_MIN
 } from "../lib/calendar";
 import { buildSystemPrompt } from "../lib/prompt";
-import { runTurnWithRepair } from "../lib/turn-runner";
-import { summarizeSlots } from "../lib/slots";
+import { runTurnWithRepair, type StreamOptions } from "../lib/turn-runner";
+import { summarizeSlots, parseUhrzeit, checkRequestedTime } from "../lib/slots";
 
 // Thorsten/Piper-TTS (über den ct-agent-Bridge-Dienst) liefert WAV, nicht das Default mp3.
 const VoiceAgent = withVoice(Agent, { audioFormat: "wav" });
@@ -38,6 +38,11 @@ const LIGHTLLM_MODEL_ID = "local-devstral-small2";
 type LlmProviderName = "auto" | "workers-ai" | "lightllm";
 const SERVICE_KEY_ENUM = SERVICE_KEYS as [ServiceKey, ...ServiceKey[]];
 const DAY_MS = 86_400_000;
+// Aussagen "Zeit nicht frei" -- duerfen nur aus einem Werkzeugergebnis stammen.
+const UNAVAILABLE_PATTERN =
+  /\b(vergeben|belegt|ausgebucht|besetzt)\b|\bnicht\s+(mehr\s+)?(frei|verf[uü]gbar)\b|\bnichts\s+(mehr\s+)?frei\b/i;
+// Duzen: Der Salon spricht Gaeste mit "Sie" an.
+const DU_PATTERN = /\b(du|dir|dich|dein|deine|deinen|deinem|deiner|deines)\b/i;
 
 function newId(): string {
   return crypto.randomUUID();
@@ -178,6 +183,15 @@ export class SalonAgent extends VoiceAgent<Env> {
   // Sprachagent: Werkzeuge & Gesprächslogik
   // ---------------------------------------------------------------------
 
+  // Signal an alle verbundenen Seiten: Die Uebersicht "Wie frei sind wir?" neu laden.
+  private notifyAvailabilityChanged() {
+    try {
+      this.broadcast(JSON.stringify({ type: "availability_changed" }));
+    } catch (err) {
+      console.warn("[availability] Broadcast fehlgeschlagen", err);
+    }
+  }
+
   // Findet den gemeinten, kuenftigen Termin. Die termin_id aus einem frueheren Gespraechszug
   // steht nicht mehr im Verlauf (nur Text wird gespeichert); deshalb ist die Telefonnummer
   // ein gleichwertiger Schluessel. Frei erfundene IDs duerfen nie zu "Erfolg" fuehren.
@@ -225,12 +239,14 @@ export class SalonAgent extends VoiceAgent<Env> {
     const self = this;
     return {
       pruefe_verfuegbarkeit: tool({
-        description: "Prüft freie Termin-Slots an einem bestimmten Datum für eine Leistung.",
+        description:
+          "Prüft freie Termin-Slots an einem bestimmten Datum für eine Leistung. Nennt der Gast eine bestimmte Uhrzeit, übergib sie IMMER als uhrzeit; nur so erfährst du verlässlich, ob genau diese Zeit frei ist.",
         inputSchema: z.object({
           datum: z.string().describe("Datum im Format YYYY-MM-DD"),
-          leistung: z.enum(SERVICE_KEY_ENUM)
+          leistung: z.enum(SERVICE_KEY_ENUM),
+          uhrzeit: z.string().optional().describe("Gewünschte Uhrzeit, z.B. 10:00 oder 10 Uhr")
         }),
-        execute: async ({ datum, leistung }) => {
+        execute: async ({ datum, leistung, uhrzeit }) => {
           const now = Date.now();
           if (!isWithinBookingHorizon(datum, now)) {
             return { status: "zu_weit_in_zukunft", hinweis: "Termine sind maximal 60 Tage im Voraus buchbar." };
@@ -243,10 +259,20 @@ export class SalonAgent extends VoiceAgent<Env> {
             return { status: "keine_freien_slots", wochentag: weekdayNameDe(datum) };
           }
           // Vollstaendige Liste plus fertiger Satz: das Modell soll Uhrzeiten nicht neu abtippen.
+          const summary = summarizeSlots(slots.map((s) => toTimeStr(s)), SLOT_STEP_MIN);
+          const requested = uhrzeit ? parseUhrzeit(uhrzeit) : null;
           return {
             status: "ok",
             wochentag: weekdayNameDe(datum),
-            ...summarizeSlots(slots.map((s) => toTimeStr(s)), SLOT_STEP_MIN)
+            ...summary,
+            // Ob GENAU die gewuenschte Zeit frei ist, entscheidet nur dieses Feld.
+            ...(uhrzeit
+              ? {
+                  gewuenschte_zeit: requested
+                    ? checkRequestedTime(requested, summary.freie_zeiten)
+                    : { hinweis: "Uhrzeit nicht lesbar, bitte beim Gast nachfragen." }
+                }
+              : {})
           };
         }
       }),
@@ -274,6 +300,7 @@ export class SalonAgent extends VoiceAgent<Env> {
           const apptId = newId();
           self.sql`INSERT INTO appointments (id, customer_name, phone, service, start_ts, end_ts, status, created_at)
             VALUES (${apptId}, ${name}, ${telefon}, ${leistung}, ${startTs}, ${endTs}, 'confirmed', ${now})`;
+          self.notifyAvailabilityChanged();
           return {
             status: "gebucht",
             termin_id: apptId,
@@ -309,6 +336,7 @@ export class SalonAgent extends VoiceAgent<Env> {
           const found = self.resolveAppointment(termin_id, telefon);
           if (!found.ok) return found.result;
           self.sql`UPDATE appointments SET status = 'cancelled' WHERE id = ${found.appt.id} AND status = 'confirmed'`;
+          self.notifyAvailabilityChanged();
           return {
             status: "abgesagt",
             wann: `${formatDateHumanDe(toDateStr(found.appt.startTs))} um ${toTimeStr(found.appt.startTs)} Uhr`
@@ -344,13 +372,20 @@ export class SalonAgent extends VoiceAgent<Env> {
             return { status: "belegt" };
           }
           self.sql`UPDATE appointments SET start_ts = ${newStart}, end_ts = ${newEnd} WHERE id = ${appt.id}`;
+          self.notifyAvailabilityChanged();
           return { status: "verschoben", bestaetigung: `${formatDateHumanDe(neues_datum)} um ${neue_uhrzeit} Uhr` };
         }
       })
     };
   }
 
-  private streamFromProvider(providerName: "workers-ai" | "lightllm", system: string, messages: unknown[], tools: ToolSet) {
+  private streamFromProvider(
+    providerName: "workers-ai" | "lightllm",
+    system: string,
+    messages: unknown[],
+    tools: ToolSet,
+    options?: StreamOptions
+  ) {
     const model =
       providerName === "workers-ai"
         ? createWorkersAI({ binding: this.env.AI })((this.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL) as never)
@@ -365,6 +400,10 @@ export class SalonAgent extends VoiceAgent<Env> {
       // biome-ignore lint: messages shape is validated by streamText itself
       messages: messages as never,
       tools,
+      // Korrekturversuch: im ersten Schritt ein Werkzeug erzwingen, danach wieder frei ("auto").
+      ...(options?.toolChoice
+        ? { prepareStep: ({ stepNumber }: { stepNumber: number }) => (stepNumber === 0 ? { toolChoice: options.toolChoice } : {}) }
+        : {}),
       stopWhen: stepCountIs(5)
     });
     return result.stream;
@@ -382,14 +421,29 @@ export class SalonAgent extends VoiceAgent<Env> {
     const providers: Array<"workers-ai" | "lightllm"> = forced === "auto" ? ["workers-ai", "lightllm"] : [forced];
     const text = await runTurnWithRepair({
       providers,
-      stream: (provider, msgs) => this.streamFromProvider(provider as "workers-ai" | "lightllm", system, msgs, tools),
+      stream: (provider, msgs, options) =>
+        this.streamFromProvider(provider as "workers-ai" | "lightllm", system, msgs, tools, options),
       tools,
       messages,
       doubledDeltaProviders: ["workers-ai"],
       claimGuards: [
         { pattern: /\bgebucht\b/i, tools: ["termin_buchen"] },
         { pattern: /\b(abgesagt|storniert)\b/i, tools: ["termin_absagen"] },
-        { pattern: /\b(verschoben|umgebucht)\b/i, tools: ["termin_verschieben"] }
+        { pattern: /\b(verschoben|umgebucht)\b/i, tools: ["termin_verschieben"] },
+        {
+          // "vergeben/nicht frei" nur, wenn die Pruefung GENAU diese Zeit als nicht frei gemeldet hat.
+          mode: "unavailable",
+          forceTool: "pruefe_verfuegbarkeit",
+          pattern: UNAVAILABLE_PATTERN,
+          hint:
+            "[Systemhinweis, nicht vom Gast] Du hast eine Uhrzeit als vergeben oder nicht frei bezeichnet, ohne dass die Verfuegbarkeitspruefung genau diese Zeit als nicht frei gemeldet hat. Rufe die Verfuegbarkeitspruefung mit dem Parameter uhrzeit auf und gib nur deren Ergebnis wieder."
+        },
+        {
+          mode: "style",
+          pattern: DU_PATTERN,
+          hint:
+            "[Systemhinweis, nicht vom Gast] Sprich den Gast durchgehend mit Sie an (Sie, Ihnen, Ihr), niemals mit du, dir oder dein. Formuliere deine letzte Antwort entsprechend neu."
+        }
       ],
       log: (msg, detail) => console.warn(`[turn] ${msg}`, detail ?? "")
     });
