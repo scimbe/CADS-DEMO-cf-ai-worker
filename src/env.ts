@@ -8,5 +8,7 @@ export interface Env {
   AUDIO_BRIDGE_URL: string;
   AUDIO_BRIDGE_TOKEN: string;
   LIGHTLLM_BASE_URL: string;
+  /** Optional: Workers-AI-Modell (Standard siehe salon-agent.ts). */
+  WORKERS_AI_MODEL?: string;
   LIGHTLLM_API_KEY: string;
 }

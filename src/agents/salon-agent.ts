@@ -27,10 +27,11 @@ import {
   weekdayOfDateStr
 } from "../lib/calendar";
 import { buildSystemPrompt } from "../lib/prompt";
+import { runTurnWithRepair } from "../lib/turn-runner";
 
 // Thorsten/Piper-TTS (über den ct-agent-Bridge-Dienst) liefert WAV, nicht das Default mp3.
 const VoiceAgent = withVoice(Agent, { audioFormat: "wav" });
-const MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const DEFAULT_WORKERS_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const LIGHTLLM_MODEL_ID = "local-devstral-small2";
 type LlmProviderName = "auto" | "workers-ai" | "lightllm";
 const SERVICE_KEY_ENUM = SERVICE_KEYS as [ServiceKey, ...ServiceKey[]];
@@ -38,64 +39,6 @@ const DAY_MS = 86_400_000;
 
 function newId(): string {
   return crypto.randomUUID();
-}
-
-interface TextDeltaLike {
-  type: string;
-  text?: string;
-}
-
-function isErrorPart(value: unknown): boolean {
-  return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "error";
-}
-
-// Fällt auf den Fallback-Stream zurück, solange noch kein echter Text an den
-// Nutzer ausgeliefert wurde (kein "text-delta"). Ein Fehler, der erst NACH
-// bereits gesprochenem Text auftritt, wird durchgereicht statt umgeschaltet
-// -- sonst drohen abgeschnittene/doppelte Sätze oder doppelt ausgeführte
-// Tool-Aufrufe (z.B. eine bereits gebuchte Terminanfrage). Wichtig: reine
-// Metadaten-Teile ("start"/"step-start" etc.) zählen NICHT als "gesprochen"
-// -- sonst würde ein Fehler, der erst als zweiter Stream-Part ankommt (der
-// übliche Fall bei Tool-fähigen Requests), am Fallback vorbeirutschen.
-async function* streamWithAutoFallback<T extends TextDeltaLike>(
-  primary: AsyncIterable<T>,
-  createFallback: () => AsyncIterable<T>
-): AsyncGenerator<T> {
-  let spokeAny = false;
-  const iterator = primary[Symbol.asyncIterator]();
-  try {
-    while (true) {
-      const next = await iterator.next();
-      if (next.done) return;
-      const part = next.value;
-      if (isErrorPart(part) && !spokeAny) {
-        console.error("Workers AI lieferte einen Fehler, wechsle zu LightLLM:", part);
-        yield* createFallback();
-        return;
-      }
-      if (part.type === "text-delta") spokeAny = true;
-      yield part;
-    }
-  } catch (err) {
-    if (spokeAny) throw err;
-    console.error("Workers AI Stream fehlgeschlagen, wechsle zu LightLLM:", err);
-    yield* createFallback();
-  }
-}
-
-async function* dedupeConsecutiveTextDeltas<T extends TextDeltaLike>(
-  source: AsyncIterable<T>
-): AsyncGenerator<T> {
-  let lastTextDelta: string | undefined;
-  for await (const part of source) {
-    if (part.type === "text-delta") {
-      if (part.text === lastTextDelta) continue;
-      lastTextDelta = part.text;
-    } else {
-      lastTextDelta = undefined;
-    }
-    yield part;
-  }
 }
 
 function json(data: unknown, status = 200): Response {
@@ -233,6 +176,49 @@ export class SalonAgent extends VoiceAgent<Env> {
   // Sprachagent: Werkzeuge & Gesprächslogik
   // ---------------------------------------------------------------------
 
+  // Findet den gemeinten, kuenftigen Termin. Die termin_id aus einem frueheren Gespraechszug
+  // steht nicht mehr im Verlauf (nur Text wird gespeichert); deshalb ist die Telefonnummer
+  // ein gleichwertiger Schluessel. Frei erfundene IDs duerfen nie zu "Erfolg" fuehren.
+  private resolveAppointment(
+    terminId: string | undefined,
+    telefon: string | undefined
+  ): { ok: true; appt: Appointment } | { ok: false; result: Record<string, unknown> } {
+    const now = Date.now();
+    if (terminId) {
+      const rows = this.sql<AppointmentRow>`SELECT * FROM appointments WHERE id = ${terminId} AND status = 'confirmed'`;
+      if (rows.length > 0) return { ok: true, appt: rowToAppointment(rows[0]) };
+    }
+    if (telefon) {
+      const rows = this.sql<AppointmentRow>`SELECT * FROM appointments
+        WHERE phone = ${telefon} AND status = 'confirmed' AND start_ts >= ${now} ORDER BY start_ts ASC`;
+      if (rows.length === 1) return { ok: true, appt: rowToAppointment(rows[0]) };
+      if (rows.length > 1) {
+        return {
+          ok: false,
+          result: {
+            status: "mehrere_termine",
+            hinweis: "Mehrere Termine gefunden. Den Gast fragen, welcher gemeint ist, dann dessen termin_id verwenden.",
+            termine: rows.map((r) => {
+              const a = rowToAppointment(r);
+              return {
+                termin_id: a.id,
+                leistung: SERVICES[a.service].label,
+                wann: `${formatDateHumanDe(toDateStr(a.startTs))} um ${toTimeStr(a.startTs)} Uhr`
+              };
+            })
+          }
+        };
+      }
+    }
+    return {
+      ok: false,
+      result: {
+        status: "nicht_gefunden",
+        hinweis: "Termin nicht gefunden. Den Gast nach der Telefonnummer fragen und diese als telefon uebergeben."
+      }
+    };
+  }
+
   private buildTools() {
     const self = this;
     return {
@@ -313,24 +299,32 @@ export class SalonAgent extends VoiceAgent<Env> {
         }
       }),
       termin_absagen: tool({
-        description: "Sagt einen bestehenden Termin anhand seiner Termin-ID ab.",
-        inputSchema: z.object({ termin_id: z.string() }),
-        execute: async ({ termin_id }) => {
-          self.sql`UPDATE appointments SET status = 'cancelled' WHERE id = ${termin_id} AND status = 'confirmed'`;
-          return { status: "abgesagt" };
+        description:
+          "Sagt einen bestehenden Termin ab. Uebergib die Telefonnummer des Gastes (telefon); termin_id nur, wenn du sie in diesem Gespraechszug aus termine_suchen kennst.",
+        inputSchema: z.object({ termin_id: z.string().optional(), telefon: z.string().optional() }),
+        execute: async ({ termin_id, telefon }) => {
+          const found = self.resolveAppointment(termin_id, telefon);
+          if (!found.ok) return found.result;
+          self.sql`UPDATE appointments SET status = 'cancelled' WHERE id = ${found.appt.id} AND status = 'confirmed'`;
+          return {
+            status: "abgesagt",
+            wann: `${formatDateHumanDe(toDateStr(found.appt.startTs))} um ${toTimeStr(found.appt.startTs)} Uhr`
+          };
         }
       }),
       termin_verschieben: tool({
-        description: "Verschiebt einen bestehenden Termin auf ein neues Datum/Uhrzeit.",
+        description:
+          "Verschiebt einen bestehenden Termin auf ein neues Datum/Uhrzeit. Uebergib die Telefonnummer des Gastes (telefon); termin_id nur, wenn du sie in diesem Gespraechszug aus termine_suchen kennst.",
         inputSchema: z.object({
-          termin_id: z.string(),
+          termin_id: z.string().optional(),
+          telefon: z.string().optional(),
           neues_datum: z.string().describe("YYYY-MM-DD"),
           neue_uhrzeit: z.string().describe("HH:mm")
         }),
-        execute: async ({ termin_id, neues_datum, neue_uhrzeit }) => {
-          const rows = self.sql<AppointmentRow>`SELECT * FROM appointments WHERE id = ${termin_id} AND status = 'confirmed'`;
-          if (rows.length === 0) return { status: "nicht_gefunden" };
-          const appt = rowToAppointment(rows[0]);
+        execute: async ({ termin_id, telefon, neues_datum, neue_uhrzeit }) => {
+          const found = self.resolveAppointment(termin_id, telefon);
+          if (!found.ok) return found.result;
+          const appt = found.appt;
           const newStart = zonedTimeToUtcMs(neues_datum, neue_uhrzeit);
           const newEnd = newStart + SERVICES[appt.service].durationMin * 60000;
           const dayAppts = self.appointmentsAround(newStart);
@@ -341,12 +335,12 @@ export class SalonAgent extends VoiceAgent<Env> {
               endTs: newEnd,
               appointments: dayAppts,
               blockers: dayBlockers,
-              excludeAppointmentId: termin_id
+              excludeAppointmentId: appt.id
             })
           ) {
             return { status: "belegt" };
           }
-          self.sql`UPDATE appointments SET start_ts = ${newStart}, end_ts = ${newEnd} WHERE id = ${termin_id}`;
+          self.sql`UPDATE appointments SET start_ts = ${newStart}, end_ts = ${newEnd} WHERE id = ${appt.id}`;
           return { status: "verschoben", bestaetigung: `${formatDateHumanDe(neues_datum)} um ${neue_uhrzeit} Uhr` };
         }
       })
@@ -356,7 +350,7 @@ export class SalonAgent extends VoiceAgent<Env> {
   private streamFromProvider(providerName: "workers-ai" | "lightllm", system: string, messages: unknown[], tools: ToolSet) {
     const model =
       providerName === "workers-ai"
-        ? createWorkersAI({ binding: this.env.AI })(MODEL_ID)
+        ? createWorkersAI({ binding: this.env.AI })((this.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL) as never)
         : createOpenAICompatible({
             name: "lightllm",
             baseURL: this.env.LIGHTLLM_BASE_URL,
@@ -378,20 +372,26 @@ export class SalonAgent extends VoiceAgent<Env> {
     const messages = [...context.messages, { role: "user", content: transcript }];
     const tools = this.buildTools();
     const forced = this.getLlmProviderSetting();
-
-    if (forced === "lightllm") {
-      return dedupeConsecutiveTextDeltas(this.streamFromProvider("lightllm", system, messages, tools));
-    }
-    if (forced === "workers-ai") {
-      return dedupeConsecutiveTextDeltas(this.streamFromProvider("workers-ai", system, messages, tools));
-    }
-
     // "auto": Workers AI zuerst, bei Fehler (z.B. Tageskontingent aufgebraucht,
-    // 4006) auf LightLLM/Devstral ausweichen -- siehe streamWithAutoFallback().
-    const primary = this.streamFromProvider("workers-ai", system, messages, tools);
-    return dedupeConsecutiveTextDeltas(
-      streamWithAutoFallback(primary, () => this.streamFromProvider("lightllm", system, messages, tools))
-    );
+    // 4006) auf LightLLM ausweichen. Werkzeugaufrufe, die ein Modell als JSON-Text
+    // ausgibt, werden erkannt und ausgefuehrt; leere Antworten werden wiederholt und
+    // enden notfalls in einem freundlichen Ersatzsatz (siehe lib/turn-runner.ts).
+    const providers: Array<"workers-ai" | "lightllm"> = forced === "auto" ? ["workers-ai", "lightllm"] : [forced];
+    const text = await runTurnWithRepair({
+      providers,
+      stream: (provider, msgs) => this.streamFromProvider(provider as "workers-ai" | "lightllm", system, msgs, tools),
+      tools,
+      messages,
+      claimGuards: [
+        { pattern: /\bgebucht\b/i, tools: ["termin_buchen"] },
+        { pattern: /\b(abgesagt|storniert)\b/i, tools: ["termin_absagen"] },
+        { pattern: /\b(verschoben|umgebucht)\b/i, tools: ["termin_verschieben"] }
+      ],
+      log: (msg, detail) => console.warn(`[turn] ${msg}`, detail ?? "")
+    });
+    return (async function* () {
+      yield { type: "text-delta", id: "reply", text };
+    })();
   }
 
   // ---------------------------------------------------------------------
