@@ -9,5 +9,4 @@ export interface Env {
   AUDIO_BRIDGE_TOKEN: string;
   LIGHTLLM_BASE_URL: string;
   LIGHTLLM_API_KEY: string;
-  PUBLIC_BASE_URL: string;
 }

@@ -3,6 +3,7 @@ import type { Connection } from "agents";
 import { withVoice, WorkersAIFluxSTT, type VoiceTurnContext } from "@cloudflare/voice";
 import { CtAgentBridgeTTS } from "../lib/ctagent-tts";
 import { LightLlmSTT } from "../lib/lightllm-stt";
+import { AutoFallbackSTT } from "../lib/auto-fallback-stt";
 import { createWorkersAI } from "workers-ai-provider";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { streamText, tool, stepCountIs, type ToolSet } from "ai";
@@ -48,12 +49,37 @@ function isErrorPart(value: unknown): boolean {
   return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "error";
 }
 
-async function* prependAndContinue<T>(first: IteratorResult<T>, rest: AsyncIterator<T>): AsyncGenerator<T> {
-  if (!first.done) yield first.value;
-  while (true) {
-    const next = await rest.next();
-    if (next.done) return;
-    yield next.value;
+// Fällt auf den Fallback-Stream zurück, solange noch kein echter Text an den
+// Nutzer ausgeliefert wurde (kein "text-delta"). Ein Fehler, der erst NACH
+// bereits gesprochenem Text auftritt, wird durchgereicht statt umgeschaltet
+// -- sonst drohen abgeschnittene/doppelte Sätze oder doppelt ausgeführte
+// Tool-Aufrufe (z.B. eine bereits gebuchte Terminanfrage). Wichtig: reine
+// Metadaten-Teile ("start"/"step-start" etc.) zählen NICHT als "gesprochen"
+// -- sonst würde ein Fehler, der erst als zweiter Stream-Part ankommt (der
+// übliche Fall bei Tool-fähigen Requests), am Fallback vorbeirutschen.
+async function* streamWithAutoFallback<T extends TextDeltaLike>(
+  primary: AsyncIterable<T>,
+  createFallback: () => AsyncIterable<T>
+): AsyncGenerator<T> {
+  let spokeAny = false;
+  const iterator = primary[Symbol.asyncIterator]();
+  try {
+    while (true) {
+      const next = await iterator.next();
+      if (next.done) return;
+      const part = next.value;
+      if (isErrorPart(part) && !spokeAny) {
+        console.error("Workers AI lieferte einen Fehler, wechsle zu LightLLM:", part);
+        yield* createFallback();
+        return;
+      }
+      if (part.type === "text-delta") spokeAny = true;
+      yield part;
+    }
+  } catch (err) {
+    if (spokeAny) throw err;
+    console.error("Workers AI Stream fehlgeschlagen, wechsle zu LightLLM:", err);
+    yield* createFallback();
   }
 }
 
@@ -125,19 +151,20 @@ export class SalonAgent extends VoiceAgent<Env> {
     voice: "primary"
   });
 
-  // Kurzlebiger Zwischenspeicher für STT-Audio-Clips (LightLLM-Fallback):
-  // LLM2s speech_to_text-Handler holt sich die Datei per HTTPS-URL selbst ab,
-  // daher wird sie hier kurz unter /stt-audio/:id bereitgestellt statt hochgeladen.
-  #pendingSttClips = new Map<string, ArrayBuffer>();
-
   createTranscriber(): import("@cloudflare/voice").Transcriber | null {
-    if (this.getLlmProviderSetting() !== "lightllm") return this.transcriber ?? null;
-    return new LightLlmSTT({
-      bridgeUrl: this.env.AUDIO_BRIDGE_URL,
-      bridgeToken: this.env.AUDIO_BRIDGE_TOKEN,
-      publicBaseUrl: this.env.PUBLIC_BASE_URL,
-      storeClip: (id, bytes) => this.#pendingSttClips.set(id, bytes)
-    });
+    const provider = this.getLlmProviderSetting();
+    const createLightLlmStt = () =>
+      new LightLlmSTT({
+        bridgeUrl: this.env.AUDIO_BRIDGE_URL,
+        bridgeToken: this.env.AUDIO_BRIDGE_TOKEN
+      });
+    if (provider === "lightllm") return createLightLlmStt();
+    if (provider === "workers-ai") return this.transcriber ?? null;
+    // "auto": Workers AI Flux zuerst, bei Verbindungsfehler (z.B. Kontingent
+    // aufgebraucht) vor der ersten echten Transkription transparent auf
+    // LightLLM-Streaming umschalten -- analog zum Text-Fallback in onTurn().
+    if (!this.transcriber) return createLightLlmStt();
+    return new AutoFallbackSTT(this.transcriber, createLightLlmStt);
   }
 
   onStart() {
@@ -359,25 +386,12 @@ export class SalonAgent extends VoiceAgent<Env> {
       return dedupeConsecutiveTextDeltas(this.streamFromProvider("workers-ai", system, messages, tools));
     }
 
-    // "auto": Workers AI zuerst, bei sofortigem Fehler (z.B. Tageskontingent
-    // aufgebraucht, Fehler 4006) auf LightLLM/Devstral ausweichen. Nur der
-    // ERSTE Stream-Part wird geprüft -- ein Fehler mitten im Turn (nach
-    // bereits gesprochenem Text) wird nicht mehr umgeschaltet, das würde
-    // abgeschnittene/doppelte Sätze riskieren.
+    // "auto": Workers AI zuerst, bei Fehler (z.B. Tageskontingent aufgebraucht,
+    // 4006) auf LightLLM/Devstral ausweichen -- siehe streamWithAutoFallback().
     const primary = this.streamFromProvider("workers-ai", system, messages, tools);
-    const iterator = primary[Symbol.asyncIterator]();
-    let first: Awaited<ReturnType<typeof iterator.next>>;
-    try {
-      first = await iterator.next();
-    } catch (err) {
-      console.error("Workers AI Stream-Start fehlgeschlagen, wechsle zu LightLLM:", err);
-      return dedupeConsecutiveTextDeltas(this.streamFromProvider("lightllm", system, messages, tools));
-    }
-    if (!first.done && isErrorPart(first.value)) {
-      console.error("Workers AI lieferte sofort einen Fehler, wechsle zu LightLLM:", first.value);
-      return dedupeConsecutiveTextDeltas(this.streamFromProvider("lightllm", system, messages, tools));
-    }
-    return dedupeConsecutiveTextDeltas(prependAndContinue(first, iterator));
+    return dedupeConsecutiveTextDeltas(
+      streamWithAutoFallback(primary, () => this.streamFromProvider("lightllm", system, messages, tools))
+    );
   }
 
   // ---------------------------------------------------------------------
@@ -390,13 +404,6 @@ export class SalonAgent extends VoiceAgent<Env> {
 
     if (request.method === "GET" && path === "/availability") {
       return this.handleAvailability(url);
-    }
-    if (request.method === "GET" && path.startsWith("/stt-audio/")) {
-      const id = decodeURIComponent(path.split("/").pop() ?? "");
-      const bytes = this.#pendingSttClips.get(id);
-      if (!bytes) return new Response("Not found", { status: 404 });
-      this.#pendingSttClips.delete(id); // Einmal-Abruf
-      return new Response(bytes, { headers: { "content-type": "audio/wav" } });
     }
     if (request.method === "POST" && path === "/admin/login") {
       return this.handleAdminLogin(request);
