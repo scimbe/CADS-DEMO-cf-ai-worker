@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROVIDER_ORDER, describeProviderOrder, parseProviderOrder, resolveProviders } from "../src/lib/provider-order";
+import { DEFAULT_PROVIDER_ORDER, DEFAULT_STT_ORDER, describeProviderOrder, parseProviderOrder, parseSttOrder, resolveProviders } from "../src/lib/provider-order";
 
 describe("parseProviderOrder", () => {
   it("liest die Reihenfolge aus der Konfiguration", () => {
@@ -47,5 +47,19 @@ describe("describeProviderOrder", () => {
   it("beschreibt die wirksame Reihenfolge fuer das Startlog", () => {
     expect(describeProviderOrder("auto", ["lightllm", "workers-ai"])).toBe("auto -> lightllm -> workers-ai");
     expect(describeProviderOrder("workers-ai", ["lightllm", "workers-ai"])).toBe("fest: workers-ai (ohne Rueckfall)");
+  });
+});
+
+describe("parseSttOrder", () => {
+  it("liest die Reihenfolge, verwirft Unbekanntes und Doppeltes", () => {
+    expect(parseSttOrder("whisper,workers-ai")).toEqual(["whisper", "workers-ai"]);
+    expect(parseSttOrder("workers-ai whisper")).toEqual(["workers-ai", "whisper"]);
+    expect(parseSttOrder("foo,whisper,whisper")).toEqual(["whisper"]);
+  });
+
+  it("nutzt Whisper zuerst, wenn nichts oder Unbrauchbares konfiguriert ist", () => {
+    expect(DEFAULT_STT_ORDER).toEqual(["whisper", "workers-ai"]);
+    expect(parseSttOrder(undefined)).toEqual(["whisper", "workers-ai"]);
+    expect(parseSttOrder("lightllm")).toEqual(["whisper", "workers-ai"]);
   });
 });

@@ -32,7 +32,9 @@ import { runTurnWithRepair, executeLeaked, type StreamOptions } from "../lib/tur
 import { recoverTurn, renderToolOutput, parseExtraction, transcriptFrom, EXTRACT_SYSTEM, type Extracted } from "../lib/recovery";
 import { longDateDe } from "../lib/dates-de";
 import { intentFromText, type Intent } from "../lib/text-guards";
-import { describeProviderOrder, parseProviderOrder, resolveProviders } from "../lib/provider-order";
+import { describeProviderOrder, parseProviderOrder, parseSttOrder, resolveProviders } from "../lib/provider-order";
+import { WhisperSTT } from "../lib/whisper-stt";
+import { chainTranscribers } from "../lib/stt-chain";
 import { summarizeSlots, parseUhrzeit, checkRequestedTime } from "../lib/slots";
 
 // Thorsten/Piper-TTS (über den ct-agent-Bridge-Dienst) liefert WAV, nicht das Default mp3.
@@ -114,11 +116,22 @@ export class SalonAgent extends VoiceAgent<Env> {
       });
     if (provider === "lightllm") return createLightLlmStt();
     if (provider === "workers-ai") return this.transcriber ?? null;
-    // "auto": Workers AI Flux zuerst, bei Verbindungsfehler (z.B. Kontingent
-    // aufgebraucht) vor der ersten echten Transkription transparent auf
-    // LightLLM-Streaming umschalten -- analog zum Text-Fallback in onTurn().
-    if (!this.transcriber) return createLightLlmStt();
-    return new AutoFallbackSTT(this.transcriber, createLightLlmStt);
+    // "auto": Reihenfolge aus STT_PROVIDER_ORDER (Standard: lokales Whisper zuerst, dann Workers AI Flux);
+    // der Kanal-Dienst (LightLLM-Streaming) bleibt letzte Rettung. Ein Fehler VOR der ersten
+    // erfolgreichen Transkription wechselt transparent zum naechsten Anbieter.
+    const factories: Array<() => import("@cloudflare/voice").Transcriber> = [];
+    for (const name of parseSttOrder(this.env.STT_PROVIDER_ORDER)) {
+      if (name === "whisper" && this.env.STT_WHISPER_URL) {
+        const baseUrl = this.env.STT_WHISPER_URL;
+        factories.push(() => new WhisperSTT({ baseUrl }));
+      }
+      if (name === "workers-ai" && this.transcriber) {
+        const flux = this.transcriber;
+        factories.push(() => flux);
+      }
+    }
+    factories.push(createLightLlmStt);
+    return chainTranscribers(factories);
   }
 
   onStart() {
@@ -153,6 +166,10 @@ export class SalonAgent extends VoiceAgent<Env> {
       `[config] LLM-Anbieter: ${describeProviderOrder(this.getLlmProviderSetting(), order)}; ` +
         `LiteLLM ${this.env.LIGHTLLM_BASE_URL} Modell ${this.env.LIGHTLLM_MODEL || LIGHTLLM_MODEL_ID}; ` +
         `Workers AI Modell ${this.env.WORKERS_AI_MODEL || DEFAULT_WORKERS_AI_MODEL}`
+    );
+    console.log(
+      `[config] STT-Anbieter (auto): ${parseSttOrder(this.env.STT_PROVIDER_ORDER).join(" -> ")} -> kanal; ` +
+        `Whisper ${this.env.STT_WHISPER_URL ?? "(nicht konfiguriert)"}`
     );
   }
 

@@ -28,3 +28,19 @@ export function resolveProviders(setting: "auto" | ProviderName, order: readonly
 export function describeProviderOrder(setting: string, order: readonly ProviderName[]): string {
   return setting === "auto" ? `auto -> ${order.join(" -> ")}` : `fest: ${setting} (ohne Rueckfall)`;
 }
+
+// ---- Spracherkennung (STT) -------------------------------------------------------------------
+// "whisper" = lokaler stt-service (faster-whisper) auf demselben Host, "workers-ai" = Flux.
+// Der Kanal-Dienst (LightLLM-STT ueber die Audio-Bridge) bleibt als letzte Rettung hinter der Kette.
+export type SttProviderName = "whisper" | "workers-ai";
+
+export const DEFAULT_STT_ORDER: readonly SttProviderName[] = ["whisper", "workers-ai"];
+
+export function parseSttOrder(raw: string | undefined | null): SttProviderName[] {
+  const out: SttProviderName[] = [];
+  for (const part of (raw ?? "").split(/[,\s]+/)) {
+    const p = part.trim().toLowerCase();
+    if ((p === "whisper" || p === "workers-ai") && !out.includes(p)) out.push(p);
+  }
+  return out.length > 0 ? out : [...DEFAULT_STT_ORDER];
+}
