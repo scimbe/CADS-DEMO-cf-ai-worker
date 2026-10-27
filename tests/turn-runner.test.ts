@@ -230,7 +230,7 @@ describe("Anrede, Werkzeug-Erzaehlung und unbelegte Nicht-frei-Aussagen", () => 
     expect(out).toBe("Am Montag ist leider nichts mehr frei.");
   });
 
-  it("erzwingt beim Korrekturversuch genau das belegende Werkzeug (toolChoice im ersten Schritt)", async () => {
+  it("erzwingt beim Korrekturversuch einen Werkzeugaufruf (toolChoice required im ersten Schritt)", async () => {
     const seen: Array<unknown> = [];
     let n = 0;
     const stream = (_p: string, _m: unknown[], options?: { toolChoice?: unknown }) => {
@@ -250,6 +250,100 @@ describe("Anrede, Werkzeug-Erzaehlung und unbelegte Nicht-frei-Aussagen", () => 
       claimGuards: [{ pattern: /\b(abgesagt|storniert)\b/i, tools: ["termin_absagen"] }]
     });
     expect(out).toBe("Ihr Termin wurde abgesagt.");
-    expect(seen).toEqual([undefined, { type: "tool", toolName: "termin_absagen" }]);
+    expect(seen).toEqual([undefined, "required"]);
+  });
+
+  describe("Wiederherstellung und Textsegmente", () => {
+    const claim = [{ pattern: /\bgebucht\b/i, tools: ["termin_buchen"] }];
+
+    it("setzt ein Leerzeichen zwischen Textsegmenten verschiedener Schritte", async () => {
+      const stream = () =>
+        parts({ type: "text-start" }, text("Ich pruefe das."), { type: "text-start" }, text("Ja, 10:00 Uhr ist frei."));
+      const out = await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [] });
+      expect(out).toBe("Ich pruefe das. Ja, 10:00 Uhr ist frei.");
+    });
+
+    it("ruft die Wiederherstellung, wenn das Modell trotz Korrektur nur behauptet", async () => {
+      const recover = vi.fn(async () => "Soll ich den Termin verbindlich buchen?");
+      const stream = () => parts(text("Ihr Termin ist gebucht."));
+      const out = await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [], claimGuards: claim, recover });
+      expect(out).toBe("Soll ich den Termin verbindlich buchen?");
+      expect(recover).toHaveBeenCalledTimes(1);
+    });
+
+    it("ruft die Wiederherstellung auch bei Fehlern aller Anbieter und leeren Antworten", async () => {
+      const recover = vi.fn(async () => "Gerettet.");
+      expect(await runTurnWithRepair({ providers: ["a", "b"], stream: () => parts({ type: "error", error: "x" }), tools: makeTools([]), messages: [], recover })).toBe("Gerettet.");
+      expect(await runTurnWithRepair({ providers: ["a"], stream: () => parts(), tools: makeTools([]), messages: [], recover })).toBe("Gerettet.");
+    });
+
+    it("faellt auf den Ersatzsatz zurueck, wenn die Wiederherstellung nichts liefert oder scheitert", async () => {
+      const none = await runTurnWithRepair({ providers: ["a"], stream: () => parts(), tools: makeTools([]), messages: [], recover: async () => null });
+      expect(none).toBe(FALLBACK_SENTENCE);
+      const boom = await runTurnWithRepair({ providers: ["a"], stream: () => parts(), tools: makeTools([]), messages: [], recover: async () => { throw new Error("x"); } });
+      expect(boom).toBe(FALLBACK_SENTENCE);
+    });
+
+    it("fuehrt nichts doppelt aus: nach erfolgreicher Aktion ohne Text wird das Ergebnis wiedergegeben", async () => {
+      const recover = vi.fn(async () => "darf nicht gerufen werden");
+      const stream = () => parts({ type: "tool-result", toolName: "termin_buchen", output: { status: "gebucht", bestaetigung: "Mi 10:00" } });
+      const out = await runTurnWithRepair({
+        providers: ["a"],
+        stream,
+        tools: makeTools([]),
+        messages: [],
+        recover,
+        renderResult: (tool, output) => (tool === "termin_buchen" ? `Gebucht: ${String(output.bestaetigung)}` : null)
+      });
+      expect(out).toBe("Gebucht: Mi 10:00");
+      expect(recover).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Absichts-Verwechslung und erweiterte Buchungsbehauptung", () => {
+    const bookingGuard = [
+      {
+        pattern: /\b(gebucht|reserviert|eingetragen|vorgemerkt)\b|\btermin\b[^.!?]*\bbest[aä]tigt\b/i,
+        unless: /\b(abgesagt|storniert|verschoben|umgebucht)\b/i,
+        tools: ["termin_buchen"]
+      }
+    ];
+
+    it("erkennt 'Termin ... bestätigt' ohne Buchungswerkzeug als unbelegt und rettet", async () => {
+      const recover = vi.fn(async () => "Gerettet.");
+      const stream = () => parts(text("Der Termin am Mittwoch um 10:00 Uhr ist bestätigt."));
+      const out = await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [], claimGuards: bookingGuard, recover });
+      expect(out).toBe("Gerettet.");
+    });
+
+    it("laesst Absage-Wortlaut trotz 'bestätigt' durch (unless)", async () => {
+      const stream = () => parts({ type: "tool-result", toolName: "termin_absagen", output: { status: "abgesagt" } }, text("Ihre Absage ist bestätigt, der Termin wurde abgesagt."));
+      const out = await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [], claimGuards: bookingGuard });
+      expect(out).toBe("Ihre Absage ist bestätigt, der Termin wurde abgesagt.");
+    });
+
+    it("rettet sofort, wenn ein Werkzeug wegen verwechselter Aktion abgelehnt wurde", async () => {
+      const recover = vi.fn(async () => "Ihr Termin wurde abgesagt.");
+      const stream = vi.fn(() =>
+        parts({ type: "tool-result", toolName: "termin_buchen", output: { status: "abgelehnt" } }, text("Der Termin ist leider bereits vergeben."))
+      );
+      const out = await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [], recover });
+      expect(out).toBe("Ihr Termin wurde abgesagt.");
+      expect(recover).toHaveBeenCalledTimes(1);
+      expect(stream).toHaveBeenCalledTimes(1); // kein weiterer Modellversuch
+    });
+
+    it("rettet nicht, wenn nach der Ablehnung das richtige Werkzeug erfolgreich lief", async () => {
+      const recover = vi.fn(async () => "darf nicht gerufen werden");
+      const stream = () =>
+        parts(
+          { type: "tool-result", toolName: "termin_buchen", output: { status: "abgelehnt" } },
+          { type: "tool-result", toolName: "termin_absagen", output: { status: "abgesagt" } },
+          text("Ihr Termin wurde abgesagt.")
+        );
+      const out = await runTurnWithRepair({ providers: ["a"], stream, tools: makeTools([]), messages: [], recover });
+      expect(out).toBe("Ihr Termin wurde abgesagt.");
+      expect(recover).not.toHaveBeenCalled();
+    });
   });
 });

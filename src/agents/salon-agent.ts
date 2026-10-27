@@ -6,7 +6,7 @@ import { LightLlmSTT } from "../lib/lightllm-stt";
 import { AutoFallbackSTT } from "../lib/auto-fallback-stt";
 import { createWorkersAI } from "workers-ai-provider";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { streamText, tool, stepCountIs, type ToolSet } from "ai";
+import { streamText, generateText, tool, stepCountIs, type ToolSet } from "ai";
 import { z } from "zod";
 import type { Env } from "../env";
 import {
@@ -28,7 +28,10 @@ import {
   SLOT_STEP_MIN
 } from "../lib/calendar";
 import { buildSystemPrompt } from "../lib/prompt";
-import { runTurnWithRepair, type StreamOptions } from "../lib/turn-runner";
+import { runTurnWithRepair, executeLeaked, type StreamOptions } from "../lib/turn-runner";
+import { recoverTurn, renderToolOutput, parseExtraction, transcriptFrom, EXTRACT_SYSTEM, type Extracted } from "../lib/recovery";
+import { longDateDe } from "../lib/dates-de";
+import { intentFromText, type Intent } from "../lib/text-guards";
 import { summarizeSlots, parseUhrzeit, checkRequestedTime } from "../lib/slots";
 
 // Thorsten/Piper-TTS (über den ct-agent-Bridge-Dienst) liefert WAV, nicht das Default mp3.
@@ -183,6 +186,43 @@ export class SalonAgent extends VoiceAgent<Env> {
   // Sprachagent: Werkzeuge & Gesprächslogik
   // ---------------------------------------------------------------------
 
+  // Rohangaben (Aktion, Name, Telefon, Datum ...) als JSON aus dem Gespraech lesen. Fehler -> null.
+  private async extractIntent(messages: unknown[]): Promise<Extracted | null> {
+    try {
+      const model = createOpenAICompatible({
+        name: "lightllm",
+        baseURL: this.env.LIGHTLLM_BASE_URL,
+        apiKey: this.env.LIGHTLLM_API_KEY
+      })(LIGHTLLM_MODEL_ID);
+      const { text } = await generateText({
+        model,
+        system: EXTRACT_SYSTEM,
+        prompt: `Heute ist ${longDateDe(toDateStr(Date.now()))}.\n\nGespräch:\n${transcriptFrom(messages)}\n\nJSON:`,
+        temperature: 0,
+        maxOutputTokens: 300
+      });
+      return parseExtraction(text);
+    } catch (err) {
+      console.warn("[recover] Extraktion fehlgeschlagen", err);
+      return null;
+    }
+  }
+
+  // Letzte Nachricht des Gastes (fuer die Absichts-Sperre der Werkzeuge).
+  private lastUserText = "";
+
+  // Verwechselte Aktion verhindern: Sagt der Gast "absagen", darf keine Buchung ausgefuehrt werden.
+  private intentConflict(tool: Intent): Record<string, unknown> | null {
+    const intent = intentFromText(this.lastUserText);
+    if (intent && intent !== tool) {
+      return {
+        status: "abgelehnt",
+        hinweis: `Der Gast moechte ${intent}, nicht ${tool}. Fuehre ${intent} aus bzw. frage nach.`
+      };
+    }
+    return null;
+  }
+
   // Signal an alle verbundenen Seiten: Die Uebersicht "Wie frei sind wir?" neu laden.
   private notifyAvailabilityChanged() {
     try {
@@ -286,6 +326,8 @@ export class SalonAgent extends VoiceAgent<Env> {
           uhrzeit: z.string().describe("HH:mm")
         }),
         execute: async ({ name, telefon, leistung, datum, uhrzeit }) => {
+          const conflict = self.intentConflict("buchen");
+          if (conflict) return conflict;
           const now = Date.now();
           const startTs = zonedTimeToUtcMs(datum, uhrzeit);
           const endTs = startTs + SERVICES[leistung].durationMin * 60000;
@@ -333,6 +375,8 @@ export class SalonAgent extends VoiceAgent<Env> {
           "Sagt einen bestehenden Termin ab. Uebergib die Telefonnummer des Gastes (telefon); termin_id nur, wenn du sie in diesem Gespraechszug aus termine_suchen kennst.",
         inputSchema: z.object({ termin_id: z.string().optional(), telefon: z.string().optional() }),
         execute: async ({ termin_id, telefon }) => {
+          const conflict = self.intentConflict("absagen");
+          if (conflict) return conflict;
           const found = self.resolveAppointment(termin_id, telefon);
           if (!found.ok) return found.result;
           self.sql`UPDATE appointments SET status = 'cancelled' WHERE id = ${found.appt.id} AND status = 'confirmed'`;
@@ -353,6 +397,8 @@ export class SalonAgent extends VoiceAgent<Env> {
           neue_uhrzeit: z.string().describe("HH:mm")
         }),
         execute: async ({ termin_id, telefon, neues_datum, neue_uhrzeit }) => {
+          const conflict = self.intentConflict("verschieben");
+          if (conflict) return conflict;
           const found = self.resolveAppointment(termin_id, telefon);
           if (!found.ok) return found.result;
           const appt = found.appt;
@@ -412,6 +458,7 @@ export class SalonAgent extends VoiceAgent<Env> {
   async onTurn(transcript: string, context: VoiceTurnContext) {
     const system = buildSystemPrompt({ salonName: this.env.SALON_NAME, nowMs: Date.now() });
     const messages = [...context.messages, { role: "user", content: transcript }];
+    this.lastUserText = transcript;
     const tools = this.buildTools();
     const forced = this.getLlmProviderSetting();
     // "auto": Workers AI zuerst, bei Fehler (z.B. Tageskontingent aufgebraucht,
@@ -426,8 +473,24 @@ export class SalonAgent extends VoiceAgent<Env> {
       tools,
       messages,
       doubledDeltaProviders: ["workers-ai"],
+      renderResult: renderToolOutput,
+      recover: async () => {
+        const recovered = await recoverTurn({
+          extract: () => this.extractIntent(messages),
+          callTool: async (name, args) => (await executeLeaked(tools, name, args)) as Record<string, unknown>,
+          nowMs: Date.now(),
+          log: (msg, detail) => console.warn(`[recover] ${msg}`, detail ?? "")
+        });
+        console.warn("[recover] Ergebnis:", recovered ?? "(nichts)");
+        return recovered;
+      },
       claimGuards: [
-        { pattern: /\bgebucht\b/i, tools: ["termin_buchen"] },
+        {
+          // Buchungsbehauptung: auch "bestätigt/reserviert/eingetragen" zaehlen -- ausser bei Absage-Wortlaut.
+          pattern: /\b(gebucht|reserviert|eingetragen|vorgemerkt)\b|\btermin\b[^.!?]*\bbest[aä]tigt\b/i,
+          unless: /\b(abgesagt|storniert|verschoben|umgebucht)\b/i,
+          tools: ["termin_buchen"]
+        },
         { pattern: /\b(abgesagt|storniert)\b/i, tools: ["termin_absagen"] },
         { pattern: /\b(verschoben|umgebucht)\b/i, tools: ["termin_verschieben"] },
         {

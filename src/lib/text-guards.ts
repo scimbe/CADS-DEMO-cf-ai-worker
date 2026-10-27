@@ -9,7 +9,7 @@ const NARRATION = new RegExp(
   [
     `\\b(?:werkzeug\\w*|tools?|funktionsaufruf\\w*|funktion|datenbank\\w*|api|systemhinweis)\\b`,
     `\\b(?:${TOOL_NAMES})\\b`,
-    `\\bich\\s+(?:rufe|starte|führe|fuehre|nutze|verwende|benutze)\\b[^.!?]*\\b(?:auf|aus)\\b`
+    `\\bich\\s+(?:rufe|starte|führe|fuehre|nutze|verwende|benutze)\\b[^.!?]*\\b(?:auf|aus|ab)\\b`
   ].join("|"),
   "i"
 );
@@ -47,4 +47,18 @@ export function extractTimes(text: string): Set<string> {
   for (const m of text.matchAll(/\b(\d{1,2}):(\d{2})\b/g)) out.add(pad(m[1], m[2]));
   for (const m of text.matchAll(/(?<![\d:.])\b(\d{1,2})(?:\.(\d{2}))?\s*Uhr\b/g)) out.add(pad(m[1], m[2] ?? "00"));
   return out;
+}
+
+export type Intent = "buchen" | "absagen" | "verschieben";
+
+/**
+ * Was will der Gast laut SEINER letzten Nachricht? null, wenn nicht eindeutig (z.B. nur "Ja, bitte").
+ * Dient als Sperre gegen verwechselte Aktionen (Absage-Bestaetigung darf nie eine Buchung ausloesen).
+ */
+export function intentFromText(text: string): Intent | null {
+  const s = text.toLowerCase();
+  if (/(absag|stornier|annullier)/.test(s) || /\bsag\w*\b[^.!?]*\bab\b/.test(s)) return "absagen";
+  if (/(verschieb|umbuch|umlegen|verleg)/.test(s)) return "verschieben";
+  if (/\bbuch/.test(s)) return "buchen";
+  return null;
 }
