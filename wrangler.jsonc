@@ -23,7 +23,6 @@
   "vars": {
     "SALON_NAME": "Salon Schnittwerk",
     "AUDIO_BRIDGE_URL": "http://127.0.0.1:58090",
-    "LIGHTLLM_BASE_URL": "https://llm-34a13a96.bunsenbrenner.org/v1",
-    "PUBLIC_BASE_URL": "https://assistent-cal-f29c55da.bunsenbrenner.org/agents/salon-agent/default"
+    "LIGHTLLM_BASE_URL": "https://llm-34a13a96.bunsenbrenner.org/v1"
   }
 }

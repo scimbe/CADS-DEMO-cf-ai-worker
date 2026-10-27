@@ -10,7 +10,7 @@ const STATUS_LABEL: Record<string, string> = {
   idle: "Bereit für Ihren Anruf",
   listening: "Ich höre zu …",
   thinking: "Einen Moment …",
-  speaking: "Lea spricht …"
+  speaking: "Thomas spricht …"
 };
 
 function initVoiceWidget() {
