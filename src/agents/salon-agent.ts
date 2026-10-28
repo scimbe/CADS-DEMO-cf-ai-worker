@@ -325,10 +325,14 @@ export class SalonAgent extends VoiceAgent<Env> {
           // Vollstaendige Liste plus fertiger Satz: das Modell soll Uhrzeiten nicht neu abtippen.
           const summary = summarizeSlots(slots.map((s) => toTimeStr(s)), SLOT_STEP_MIN);
           const requested = uhrzeit ? parseUhrzeit(uhrzeit) : null;
+          // Die vollstaendige Liste bleibt intern (gewuenschte_zeit); das Modell bekommt nur die Zeitfenster,
+          // sonst liest es am Telefon jede einzelne Startzeit vor (live: 15 Uhrzeiten am Stueck).
+          const { freie_zeiten, ...spoken } = summary;
           return {
             status: "ok",
             wochentag: weekdayNameDe(datum),
-            ...summary,
+            ...spoken,
+            anzahl_freie_startzeiten: freie_zeiten.length,
             // Ob GENAU die gewuenschte Zeit frei ist, entscheidet nur dieses Feld.
             ...(uhrzeit
               ? {

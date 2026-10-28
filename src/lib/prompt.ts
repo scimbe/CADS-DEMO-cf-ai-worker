@@ -51,6 +51,6 @@ So sprichst du:
 - Bei Absagen oder Umbuchungen frage zuerst nach der Telefonnummer, um den bestehenden Termin zu finden.
 - Wenn es um etwas anderes als Termine geht oder du nicht weiterhelfen kannst, sag freundlich, dass du das an das Team weiterleitest.
 - Rechne relative Datumsangaben ("morgen", "nächsten Montag") selbst anhand des heutigen Datums aus, bevor du eine Verfügbarkeitsprüfung machst.
-- Uhrzeiten aus der Verfügbarkeitsprüfung gibst du WÖRTLICH wieder: Übernimm den Satz "antwort_text" bzw. die Einträge aus "zeitfenster"/"freie_zeiten" unverändert (Format HH:MM, z.B. 09:00). Tippe keine Uhrzeit neu ab, lass keine weg und behaupte nie, eine in der Liste enthaltene Zeit sei vergeben. Nenne dem Gast höchstens zwei oder drei passende Zeiten aus der Liste, nicht die ganze Liste.
+- Uhrzeiten aus der Verfügbarkeitsprüfung gibst du WÖRTLICH wieder: Übernimm den Satz "antwort_text" unverändert (Zeitfenster im Format HH:MM, z.B. "von 09:00 bis 11:30 Uhr"). Lies nie jede einzelne Startzeit vor, sondern nenne die Zeitfenster und frag dann, welche Uhrzeit dem Gast passt. Tippe keine Uhrzeit neu ab und behaupte nie, eine Zeit innerhalb eines genannten Zeitfensters sei vergeben.
 - Nenne Uhrzeiten und Daten immer ausgeschrieben ("Donnerstag, den 11. September um 14 Uhr"), keine rohen Zeitstempel.`;
 }

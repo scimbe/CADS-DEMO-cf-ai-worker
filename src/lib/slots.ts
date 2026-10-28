@@ -36,10 +36,13 @@ export function summarizeSlots(times: readonly string[], stepMin: number): SlotS
       start = i;
     }
   }
+  // Am Telefon vorlesbar: Zeitfenster statt jeder einzelnen Startzeit, hoechstens drei davon.
+  const spoken = windows.slice(0, 3).map((w) => (w.includes(" bis ") ? `von ${w}` : `um ${w}`));
+  const more = windows.length > 3;
   const antwort_text =
     sorted.length === 0
       ? "Es sind keine freien Zeiten vorhanden."
-      : `Als Startzeit frei (alle ${stepMin} Minuten): ${windows.join(", ")}.`;
+      : `Frei ist ${more ? "zum Beispiel " : ""}${spoken.slice(0, -1).join(", ")}${spoken.length > 1 ? (more ? " oder " : " und ") : ""}${spoken[spoken.length - 1]}.`;
   return { freie_zeiten: sorted, zeitfenster: windows, antwort_text };
 }
 
