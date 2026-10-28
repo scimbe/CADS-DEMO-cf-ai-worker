@@ -138,7 +138,31 @@ export class SalonAgent extends VoiceAgent<Env> {
     return chainTranscribers(factories);
   }
 
+  // Gespraechsverlauf je Verbindung. Der Voice-Mixin speichert sonst EINEN Verlauf in SQLite fuer alle
+  // Anrufer dieser Instanz ("default") -- live beantwortete ein neuer Besucher Fragen aus dem Gespraech
+  // eines anderen (Datum, Name, Telefonnummer). Der Verlauf lebt nur im Speicher und endet mit der Verbindung.
+  private readonly conversations = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
+  private static readonly HISTORY_LIMIT = 20;
+
+  saveMessage(_role: "user" | "assistant", _text: string): void {
+    // bewusst leer: kein verbindungsuebergreifender Verlauf, keine Gespraechsinhalte auf Platte
+  }
+
+  getConversationHistory(_limit?: number): Array<{ role: "user" | "assistant"; content: string }> {
+    return [];
+  }
+
+  onClose(connection: Connection) {
+    this.conversations.delete(connection.id);
+  }
+
   onStart() {
+    // Altbestand des geteilten Verlaufs entfernen (enthielt Namen und Telefonnummern frueherer Anrufer).
+    try {
+      this.sql`DELETE FROM cf_voice_messages`;
+    } catch {
+      // Tabelle existiert noch nicht
+    }
     this.sql`CREATE TABLE IF NOT EXISTS appointments (
       id TEXT PRIMARY KEY,
       customer_name TEXT NOT NULL,
@@ -489,7 +513,8 @@ export class SalonAgent extends VoiceAgent<Env> {
 
   async onTurn(transcript: string, context: VoiceTurnContext) {
     const system = buildSystemPrompt({ salonName: this.env.SALON_NAME, nowMs: Date.now() });
-    const messages = [...context.messages, { role: "user", content: transcript }];
+    const history = this.conversations.get(context.connection.id) ?? [];
+    const messages = [...history, { role: "user", content: transcript }];
     this.lastUserText = transcript;
     const tools = this.buildTools();
     const forced = this.getLlmProviderSetting();
@@ -550,6 +575,8 @@ export class SalonAgent extends VoiceAgent<Env> {
       ],
       log: (msg, detail) => console.warn(`[turn] ${msg}`, detail ?? "")
     });
+    history.push({ role: "user", content: transcript }, { role: "assistant", content: text });
+    this.conversations.set(context.connection.id, history.slice(-SalonAgent.HISTORY_LIMIT));
     return (async function* () {
       yield { type: "text-delta", id: "reply", text };
     })();
