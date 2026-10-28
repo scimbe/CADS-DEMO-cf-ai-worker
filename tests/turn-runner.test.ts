@@ -194,6 +194,21 @@ describe("Anrede, Werkzeug-Erzaehlung und unbelegte Nicht-frei-Aussagen", () => 
     expect(out).toBe("Mittwoch um 10:00 Uhr ist noch frei.");
   });
 
+  it("lehnt freie Uhrzeiten ohne Pruefung in diesem Zug ab (Fall: Liste vom Freitag fuer den 4. November kopiert)", async () => {
+    const freeGuard = [{ mode: "checked" as const, tools: ["pruefe_verfuegbarkeit"], forceTool: "pruefe_verfuegbarkeit", pattern: /\b\d{1,2}:\d{2}\b[^.!?]*\bfrei\b|\bfrei\b[^.!?]*\b\d{1,2}:\d{2}\b/i }];
+    let n = 0;
+    const checked: StreamPartLike = { type: "tool-result", toolName: "pruefe_verfuegbarkeit", output: { status: "ok", antwort_text: "Frei ist von 13:00 bis 15:00 Uhr." } };
+    const stream = () =>
+      ++n === 1
+        ? parts(text("Am 4. November sind folgende Zeiten noch frei: 09:00, 09:30, 10:00."))
+        : parts(checked, text("Frei ist von 13:00 bis 15:00 Uhr."));
+    const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: freeGuard });
+    expect(out).toBe("Frei ist von 13:00 bis 15:00 Uhr.");
+    expect(n).toBe(2);
+    const never = () => parts(text("Um 09:00 ist noch frei."));
+    expect(await runTurnWithRepair({ providers: ["a"], stream: never, tools, messages: [], claimGuards: freeGuard })).toBe(UNBACKED_SENTENCE);
+  });
+
   it("lehnt 'vergeben' ohne jede Pruefung ab und liefert nie die falsche Aussage", async () => {
     const stream = () => parts(text("10:00 Uhr ist leider schon vergeben."));
     const out = await runTurnWithRepair({ providers: ["a"], stream, tools, messages: [], claimGuards: guards });
