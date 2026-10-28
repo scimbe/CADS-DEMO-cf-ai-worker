@@ -117,4 +117,18 @@ describe("parseExtraction / transcriptFrom", () => {
     ]);
     expect(t).toBe("Gast: Haben Sie morgen frei?\nAssistent: Ja, gern, wann genau?");
   });
+
+  it("vergisst erledigte Anliegen: nach einer abgeschlossenen Absage zaehlt nur das neue Anliegen", () => {
+    const t = transcriptFrom([
+      { role: "user", content: "Ich muss den Termin am Donnerstag absagen. 0170 0000000." },
+      { role: "assistant", content: "Möchten Sie diesen Termin wirklich absagen?" },
+      { role: "user", content: "Ja, bitte absagen." },
+      { role: "assistant", content: "Ihr Termin am Donnerstag, 29.10.2026 um 14:00 Uhr wurde erfolgreich abgesagt." },
+      { role: "user", content: "Und welche Zeiten sind am Donnerstag, dem 5. November, frei?" },
+      { role: "assistant", content: "Dafür brauche ich noch die gewünschte Leistung." },
+      { role: "user", content: "Einen Haarschnitt." }
+    ]);
+    expect(t).not.toMatch(/absagen|0170/);
+    expect(t.split("\n")[0]).toBe("Gast: Und welche Zeiten sind am Donnerstag, dem 5. November, frei?");
+  });
 });

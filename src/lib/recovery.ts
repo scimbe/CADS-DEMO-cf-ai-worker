@@ -189,10 +189,20 @@ function textOfContent(content: unknown): string {
 }
 
 /** Gespraechsverlauf als Klartext ("Gast: ...", "Assistent: ..."), nur die letzten `max` Nachrichten. */
+// Bestaetigung einer abgeschlossenen Aktion (Wortlaut wie oben bzw. vom Modell). Alles davor gehoert zu einem
+// erledigten Anliegen und darf die Extraktion nicht mehr steuern -- live las sie "absagen, bestaetigt" aus
+// einer laengst erledigten Absage und haette einen echten Termin storniert.
+const COMPLETED_ACTION = /\bist fest gebucht\b|\bwurde (erfolgreich )?abgesagt\b|\bwurde auf\b[^.!?]*\bverschoben\b/i;
+
 export function transcriptFrom(messages: unknown[], max = 14): string {
-  return (messages as Array<{ role?: string; content?: unknown }>)
+  const lines = (messages as Array<{ role?: string; content?: unknown }>)
     .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => `${m.role === "user" ? "Gast" : "Assistent"}: ${textOfContent(m.content).replace(/\s+/g, " ").trim()}`)
+    .map((m) => ({ role: m.role, text: textOfContent(m.content).replace(/\s+/g, " ").trim() }));
+  let start = 0;
+  lines.forEach((l, i) => { if (l.role === "assistant" && COMPLETED_ACTION.test(l.text)) start = i + 1; });
+  return lines
+    .slice(start)
+    .map((l) => `${l.role === "user" ? "Gast" : "Assistent"}: ${l.text}`)
     .filter((l) => l.length > 10)
     .slice(-max)
     .join("\n");
@@ -204,6 +214,6 @@ Felder:
 - "bestaetigt": true NUR wenn die LETZTE Nachricht des Gastes die vom Assistenten zuvor vorgeschlagene oder erfragte Aktion ausdrücklich bestätigt oder anweist (z.B. "Ja, bitte buchen", "Ja, absagen"). Sonst false.
 - "name", "telefon": so wie der Gast sie nannte (Telefon: Ziffern und Leerzeichen), sonst null
 - "leistung": "schneiden_kurz" (Herrenhaarschnitt, kurzes Haar), "schneiden_lang", "styling", "faerben", "straehnen", "dauerwelle" oder null
-- "datum_text", "uhrzeit_text": genau wie vom Gast genannt (z.B. "Mittwoch", "morgen", "29. Oktober", "10 Uhr"), sonst null
+- "datum_text", "uhrzeit_text": genau wie vom Gast genannt, vollständig mit Tag und Monat, wenn er beides nannte (z.B. "Mittwoch", "morgen", "Donnerstag, 5. November", "10 Uhr"), sonst null
 - "neues_datum_text", "neue_uhrzeit_text": nur beim Verschieben, sonst null
 Nutze Angaben aus dem gesamten Gespräch, nicht nur aus der letzten Nachricht. Unbekanntes ist null.`;
