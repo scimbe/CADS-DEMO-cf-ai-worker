@@ -22,9 +22,11 @@ export interface StreamPartLike {
  *  - "unavailable": "vergeben/nicht frei" nur, wenn ein Werkzeug genau diese Uhrzeit als nicht frei
  *    meldete (oder den ganzen Tag als nicht buchbar). Nennt der Satz keine Uhrzeit, genuegt irgendeine
  *    Nicht-frei-Meldung.
+ *  - "checked": Aussage nur, wenn eines der `tools` in diesem Zug ueberhaupt ein Ergebnis lieferte
+ *    (z.B. "14:00 ist frei" nur nach einer Verfuegbarkeitspruefung, nicht aus dem Gespraechsverlauf).
  *  - "style": Stilregel (z.B. Anrede "Sie"); ein Korrekturversuch, danach wird der Text trotzdem geliefert.
  */
-export type GuardMode = "action" | "unavailable" | "style";
+export type GuardMode = "action" | "unavailable" | "checked" | "style";
 
 export type ToolChoiceOption = "required" | { type: "tool"; toolName: string };
 
@@ -92,6 +94,8 @@ function violated(g: ClaimGuard, text: string, ev: Evidence): boolean {
       return true;
     case "action":
       return !(g.tools ?? []).some((t) => ev.okTools.has(t));
+    case "checked":
+      return !ev.results.some((r) => (g.tools ?? []).includes(r.tool));
     case "unavailable": {
       if (ev.dayUnavailable) return false;
       for (const sentence of splitSentences(text).filter((s) => g.pattern.test(s))) {

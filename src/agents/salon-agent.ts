@@ -47,6 +47,10 @@ const DAY_MS = 86_400_000;
 // Aussagen "Zeit nicht frei" -- duerfen nur aus einem Werkzeugergebnis stammen.
 const UNAVAILABLE_PATTERN =
   /\b(vergeben|belegt|ausgebucht|besetzt)\b|\bnicht\s+(mehr\s+)?(frei|verf[uü]gbar)\b|\bnichts\s+(mehr\s+)?frei\b/i;
+// "Frei"-Aussage mit Uhrzeit. Live: Das Modell kopierte die Liste vom Freitag fuer den 4. November,
+// ohne zu pruefen -> nur nach einer Verfuegbarkeitspruefung im selben Zug erlaubt.
+const FREE_CLAIM_PATTERN =
+  /\b\d{1,2}(:\d{2}|\s*uhr)\b[^.!?]*\b(frei|verf[uü]gbar)\b|\b(frei|verf[uü]gbar)\b[^.!?]*\b\d{1,2}(:\d{2}|\s*uhr)\b/i;
 // Duzen: Der Salon spricht Gaeste mit "Sie" an.
 const DU_PATTERN = /\b(du|dir|dich|dein|deine|deinen|deinem|deiner|deines)\b/i;
 
@@ -527,6 +531,15 @@ export class SalonAgent extends VoiceAgent<Env> {
           pattern: UNAVAILABLE_PATTERN,
           hint:
             "[Systemhinweis, nicht vom Gast] Du hast eine Uhrzeit als vergeben oder nicht frei bezeichnet, ohne dass die Verfuegbarkeitspruefung genau diese Zeit als nicht frei gemeldet hat. Rufe die Verfuegbarkeitspruefung mit dem Parameter uhrzeit auf und gib nur deren Ergebnis wieder."
+        },
+        {
+          mode: "checked",
+          tools: ["pruefe_verfuegbarkeit"],
+          forceTool: "pruefe_verfuegbarkeit",
+          pattern: FREE_CLAIM_PATTERN,
+          unless: UNAVAILABLE_PATTERN,
+          hint:
+            "[Systemhinweis, nicht vom Gast] Du hast freie Uhrzeiten genannt, ohne in diesem Zug die Verfuegbarkeitspruefung aufzurufen. Frueher genannte Zeiten gelten nicht fuer einen anderen Tag. Rufe die Verfuegbarkeitspruefung fuer das gefragte Datum auf und uebernimm deren antwort_text."
         },
         {
           mode: "style",
