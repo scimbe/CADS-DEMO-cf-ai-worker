@@ -20,13 +20,19 @@ describe("summarizeSlots", () => {
     expect(r.freie_zeiten[0]).toBe("09:00");
     expect(r.freie_zeiten.every((t) => /^\d{2}:\d{2}$/.test(t))).toBe(true);
     expect(r.zeitfenster).toEqual(["09:00 bis 17:15 Uhr"]);
-    expect(r.antwort_text).toBe("Als Startzeit frei (alle 15 Minuten): 09:00 bis 17:15 Uhr.");
+    expect(r.antwort_text).toBe("Frei ist von 09:00 bis 17:15 Uhr.");
   });
 
   it("trennt Fenster an Luecken (belegte Termine)", () => {
     const r = summarizeSlots(["09:00", "09:15", "09:30", "11:00", "11:15", "15:45"], 15);
     expect(r.zeitfenster).toEqual(["09:00 bis 09:30 Uhr", "11:00 bis 11:15 Uhr", "15:45 Uhr"]);
-    expect(r.antwort_text).toContain("09:00 bis 09:30 Uhr, 11:00 bis 11:15 Uhr, 15:45 Uhr");
+    expect(r.antwort_text).toBe("Frei ist von 09:00 bis 09:30 Uhr, von 11:00 bis 11:15 Uhr und um 15:45 Uhr.");
+  });
+
+  it("liest am Telefon hoechstens drei Zeitfenster vor, nie jede Startzeit", () => {
+    const r = summarizeSlots(["09:00", "10:00", "11:00", "12:00", "13:00"], 15);
+    expect(r.antwort_text).toBe("Frei ist zum Beispiel um 09:00 Uhr, um 10:00 Uhr oder um 11:00 Uhr.");
+    expect(r.freie_zeiten).toHaveLength(5);
   });
 
   it("sortiert, entfernt Duplikate und polstert unvollstaendige Eingaben", () => {
