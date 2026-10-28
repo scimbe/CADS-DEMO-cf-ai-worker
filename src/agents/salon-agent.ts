@@ -140,9 +140,22 @@ export class SalonAgent extends VoiceAgent<Env> {
 
   // Gespraechsverlauf je Verbindung. Der Voice-Mixin speichert sonst EINEN Verlauf in SQLite fuer alle
   // Anrufer dieser Instanz ("default") -- live beantwortete ein neuer Besucher Fragen aus dem Gespraech
-  // eines anderen (Datum, Name, Telefonnummer). Der Verlauf lebt nur im Speicher und endet mit der Verbindung.
-  private readonly conversations = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
+  // eines anderen (Datum, Name, Telefonnummer). Hier: je connection.id in SQLite (ein Speicher-Map
+  // ueberlebt das Einschlafen der Instanz zwischen zwei Nachrichten nicht), geloescht bei onClose,
+  // Reste nach CONVERSATION_TTL_MS.
   private static readonly HISTORY_LIMIT = 20;
+  private static readonly CONVERSATION_TTL_MS = 2 * 60 * 60 * 1000;
+
+  private historyFor(connectionId: string): Array<{ role: "user" | "assistant"; content: string }> {
+    const rows = this.sql<{ role: string; content: string }>`
+      SELECT role, content FROM conversation_turns WHERE connection_id = ${connectionId}
+      ORDER BY seq DESC LIMIT ${SalonAgent.HISTORY_LIMIT}`;
+    return rows.reverse().map((r) => ({ role: r.role === "assistant" ? "assistant" : "user", content: r.content }));
+  }
+
+  private appendHistory(connectionId: string, role: "user" | "assistant", content: string): void {
+    this.sql`INSERT INTO conversation_turns (connection_id, role, content, ts) VALUES (${connectionId}, ${role}, ${content}, ${Date.now()})`;
+  }
 
   saveMessage(_role: "user" | "assistant", _text: string): void {
     // bewusst leer: kein verbindungsuebergreifender Verlauf, keine Gespraechsinhalte auf Platte
@@ -153,7 +166,7 @@ export class SalonAgent extends VoiceAgent<Env> {
   }
 
   onClose(connection: Connection) {
-    this.conversations.delete(connection.id);
+    this.sql`DELETE FROM conversation_turns WHERE connection_id = ${connection.id}`;
   }
 
   onStart() {
@@ -163,6 +176,14 @@ export class SalonAgent extends VoiceAgent<Env> {
     } catch {
       // Tabelle existiert noch nicht
     }
+    this.sql`CREATE TABLE IF NOT EXISTS conversation_turns (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      connection_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      ts INTEGER NOT NULL
+    )`;
+    this.sql`DELETE FROM conversation_turns WHERE ts < ${Date.now() - SalonAgent.CONVERSATION_TTL_MS}`;
     this.sql`CREATE TABLE IF NOT EXISTS appointments (
       id TEXT PRIMARY KEY,
       customer_name TEXT NOT NULL,
@@ -513,7 +534,7 @@ export class SalonAgent extends VoiceAgent<Env> {
 
   async onTurn(transcript: string, context: VoiceTurnContext) {
     const system = buildSystemPrompt({ salonName: this.env.SALON_NAME, nowMs: Date.now() });
-    const history = this.conversations.get(context.connection.id) ?? [];
+    const history = this.historyFor(context.connection.id);
     const messages = [...history, { role: "user", content: transcript }];
     this.lastUserText = transcript;
     const tools = this.buildTools();
@@ -575,8 +596,8 @@ export class SalonAgent extends VoiceAgent<Env> {
       ],
       log: (msg, detail) => console.warn(`[turn] ${msg}`, detail ?? "")
     });
-    history.push({ role: "user", content: transcript }, { role: "assistant", content: text });
-    this.conversations.set(context.connection.id, history.slice(-SalonAgent.HISTORY_LIMIT));
+    this.appendHistory(context.connection.id, "user", transcript);
+    this.appendHistory(context.connection.id, "assistant", text);
     return (async function* () {
       yield { type: "text-delta", id: "reply", text };
     })();
