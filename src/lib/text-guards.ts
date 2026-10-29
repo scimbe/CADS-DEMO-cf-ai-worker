@@ -49,6 +49,14 @@ export function extractTimes(text: string): Set<string> {
   return out;
 }
 
+/**
+ * Buchungsbehauptung in einer Antwort: darf nur stehen, wenn im selben Zug termin_buchen lief.
+ * Neben "gebucht/reserviert/eingetragen" auch das Praesens "ich buche jetzt fest" / "trage ich Sie ein"
+ * (live: so bestaetigt, ohne dass der Kalender sich aenderte). Fragen ("Buche ich das fuer Sie?") nicht.
+ */
+export const BOOKING_CLAIM_PATTERN =
+  /\b(gebucht|reserviert|eingetragen|vorgemerkt)\b|\btermin\b[^.!?]*\bbest[aä]tigt\b|\b(ich\s+(buche|trage|reserviere)|(buche|trage|reserviere)\s+ich)\b[^.!?]*(?:[.!]|$)/i;
+
 export type Intent = "buchen" | "absagen" | "verschieben";
 
 /**

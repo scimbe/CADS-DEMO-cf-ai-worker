@@ -31,7 +31,7 @@ import { buildSystemPrompt } from "../lib/prompt";
 import { runTurnWithRepair, executeLeaked, type StreamOptions } from "../lib/turn-runner";
 import { recoverTurn, renderToolOutput, parseExtraction, transcriptFrom, EXTRACT_SYSTEM, type Extracted } from "../lib/recovery";
 import { longDateDe } from "../lib/dates-de";
-import { intentFromText, type Intent } from "../lib/text-guards";
+import { BOOKING_CLAIM_PATTERN, intentFromText, type Intent } from "../lib/text-guards";
 import { describeProviderOrder, parseProviderOrder, parseSttOrder, resolveProviders } from "../lib/provider-order";
 import { WhisperSTT } from "../lib/whisper-stt";
 import { chainTranscribers } from "../lib/stt-chain";
@@ -564,7 +564,7 @@ export class SalonAgent extends VoiceAgent<Env> {
       claimGuards: [
         {
           // Buchungsbehauptung: auch "bestätigt/reserviert/eingetragen" zaehlen -- ausser bei Absage-Wortlaut.
-          pattern: /\b(gebucht|reserviert|eingetragen|vorgemerkt)\b|\btermin\b[^.!?]*\bbest[aä]tigt\b/i,
+          pattern: BOOKING_CLAIM_PATTERN,
           unless: /\b(abgesagt|storniert|verschoben|umgebucht)\b/i,
           tools: ["termin_buchen"]
         },

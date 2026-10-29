@@ -1,5 +1,27 @@
 import { describe, expect, it } from "vitest";
-import { extractTimes, intentFromText, splitSentences, stripToolNarration } from "../src/lib/text-guards";
+import { BOOKING_CLAIM_PATTERN, extractTimes, intentFromText, splitSentences, stripToolNarration } from "../src/lib/text-guards";
+
+describe("BOOKING_CLAIM_PATTERN", () => {
+  it("erkennt Buchungsbehauptungen, auch im Praesens (live ohne Kalenderaenderung gesagt)", () => {
+    for (const t of [
+      "Ich buche jetzt fest: Dienstag um 10 Uhr.",
+      "Gut, dann buche ich Ihnen den Termin am Dienstag.",
+      "Ich trage Sie für Dienstag um 10 Uhr ein.",
+      "Ihr Termin ist bestätigt: Dienstag, den 3. November um 10 Uhr.",
+      "Der Termin ist gebucht.",
+      "Ich reserviere den Platz für Sie"
+    ]) expect(BOOKING_CLAIM_PATTERN.test(t), t).toBe(true);
+  });
+
+  it("laesst Fragen und Angebote ohne Behauptung durch", () => {
+    for (const t of [
+      "Soll ich den Termin für Sie buchen?",
+      "Buche ich das so für Sie?",
+      "Möchten Sie, dass ich Sie für 10 Uhr eintrage?",
+      "Um 10 Uhr ist am Dienstag frei. Um den Termin zu buchen, benötige ich Ihre Telefonnummer."
+    ]) expect(BOOKING_CLAIM_PATTERN.test(t), t).toBe(false);
+  });
+});
 
 describe("stripToolNarration", () => {
   it("entfernt den gemeldeten Fall (Werkzeug zur Terminabsage)", () => {
