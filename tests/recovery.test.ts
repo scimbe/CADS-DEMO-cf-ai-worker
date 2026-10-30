@@ -132,3 +132,11 @@ describe("parseExtraction / transcriptFrom", () => {
     expect(t.split("\n")[0]).toBe("Gast: Und welche Zeiten sind am Donnerstag, dem 5. November, frei?");
   });
 });
+
+describe("Ablehnungen der Schreibaktionen", () => {
+  it("nennt den Grund statt eines Erfolgs oder Ersatzsatzes", () => {
+    expect(renderToolOutput("termin_buchen", { status: "geschlossen" })).toMatch(/geschlossen/);
+    expect(renderToolOutput("termin_verschieben", { status: "ausserhalb_oeffnungszeiten" })).toMatch(/Öffnungszeiten/);
+    expect(renderToolOutput("termin_verschieben", { status: "zu_kurzfristig" })).toMatch(/kurzfristig/);
+  });
+});

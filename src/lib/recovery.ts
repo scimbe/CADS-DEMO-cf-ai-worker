@@ -45,8 +45,18 @@ export function normalizeLeistung(input: string | null | undefined): ServiceKey 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 
 /** Formuliert ein Werkzeugergebnis fuer den Gast. Gibt null zurueck, wenn nichts Sinnvolles zu sagen ist. */
+const NOT_BOOKABLE: Record<string, string> = {
+  geschlossen: "An diesem Tag haben wir geschlossen. Welcher andere Tag passt Ihnen?",
+  ausserhalb_oeffnungszeiten: "Das liegt außerhalb unserer Öffnungszeiten. Welche andere Uhrzeit passt Ihnen?",
+  zu_weit_in_zukunft: "So weit im Voraus können wir noch nicht buchen. Bitte nennen Sie mir einen früheren Tag.",
+  ungueltig: "Das Datum oder die Uhrzeit habe ich nicht verstanden. Könnten Sie beides bitte noch einmal sagen?"
+};
+
 export function renderToolOutput(tool: string, output: ToolOutput): string | null {
   const status = str(output.status);
+  if ((tool === "termin_buchen" || tool === "termin_verschieben") && status && NOT_BOOKABLE[status]) {
+    return NOT_BOOKABLE[status];
+  }
   switch (tool) {
     case "termin_buchen":
       if (status === "gebucht") return `Ihr Termin am ${str(output.bestaetigung)} ist fest gebucht. Wir freuen uns auf Sie!`;
@@ -60,6 +70,7 @@ export function renderToolOutput(tool: string, output: ToolOutput): string | nul
       return null;
     case "termin_verschieben":
       if (status === "verschoben") return `Ihr Termin wurde auf ${str(output.bestaetigung)} verschoben.`;
+      if (status === "zu_kurzfristig") return "Das ist zu kurzfristig. Bitte nennen Sie mir eine spätere Zeit.";
       if (status === "belegt") return "Diese Zeit ist leider schon vergeben. Welche andere Uhrzeit passt Ihnen?";
       if (status === "mehrere_termine") return "Unter dieser Nummer gibt es mehrere Termine. Welcher soll verschoben werden?";
       if (status === "nicht_gefunden") return "Unter dieser Nummer habe ich keinen Termin gefunden.";

@@ -49,7 +49,14 @@ export interface ClaimGuard {
 }
 
 const OK_STATUS = new Set(["gebucht", "abgesagt", "verschoben"]);
-const DAY_UNAVAILABLE_STATUS = new Set(["keine_freien_slots", "zu_weit_in_zukunft", "zu_kurzfristig", "belegt"]);
+const DAY_UNAVAILABLE_STATUS = new Set([
+  "keine_freien_slots",
+  "zu_weit_in_zukunft",
+  "zu_kurzfristig",
+  "belegt",
+  "geschlossen",
+  "ausserhalb_oeffnungszeiten"
+]);
 
 interface Evidence {
   okTools: Set<string>;

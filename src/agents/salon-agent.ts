@@ -16,6 +16,7 @@ import {
   type Appointment,
   type Blocker,
   OPENING_HOURS,
+  checkBookable,
   getAvailableSlots,
   isSlotFree,
   isWithinBookingHorizon,
@@ -406,11 +407,11 @@ export class SalonAgent extends VoiceAgent<Env> {
           const conflict = self.intentConflict("buchen");
           if (conflict) return conflict;
           const now = Date.now();
-          const startTs = zonedTimeToUtcMs(datum, uhrzeit);
+          const zeit = parseUhrzeit(uhrzeit) ?? uhrzeit;
+          const bookable = checkBookable({ dateStr: datum, timeStr: zeit, service: leistung, now });
+          if (bookable !== "ok") return { status: bookable };
+          const startTs = zonedTimeToUtcMs(datum, zeit);
           const endTs = startTs + SERVICES[leistung].durationMin * 60000;
-          if (startTs < now + 30 * 60000) {
-            return { status: "zu_kurzfristig" };
-          }
           const appts = self.appointmentsAround(startTs);
           const blockers = self.blockersAround(startTs);
           if (!isSlotFree({ startTs, endTs, appointments: appts, blockers })) {
@@ -423,7 +424,7 @@ export class SalonAgent extends VoiceAgent<Env> {
           return {
             status: "gebucht",
             termin_id: apptId,
-            bestaetigung: `${formatDateHumanDe(datum)} um ${uhrzeit} Uhr`
+            bestaetigung: `${formatDateHumanDe(datum)} um ${zeit} Uhr`
           };
         }
       }),
@@ -479,7 +480,10 @@ export class SalonAgent extends VoiceAgent<Env> {
           const found = self.resolveAppointment(termin_id, telefon);
           if (!found.ok) return found.result;
           const appt = found.appt;
-          const newStart = zonedTimeToUtcMs(neues_datum, neue_uhrzeit);
+          const zeit = parseUhrzeit(neue_uhrzeit) ?? neue_uhrzeit;
+          const bookable = checkBookable({ dateStr: neues_datum, timeStr: zeit, service: appt.service, now: Date.now() });
+          if (bookable !== "ok") return { status: bookable };
+          const newStart = zonedTimeToUtcMs(neues_datum, zeit);
           const newEnd = newStart + SERVICES[appt.service].durationMin * 60000;
           const dayAppts = self.appointmentsAround(newStart);
           const dayBlockers = self.blockersAround(newStart);
@@ -496,7 +500,7 @@ export class SalonAgent extends VoiceAgent<Env> {
           }
           self.sql`UPDATE appointments SET start_ts = ${newStart}, end_ts = ${newEnd} WHERE id = ${appt.id}`;
           self.notifyAvailabilityChanged();
-          return { status: "verschoben", bestaetigung: `${formatDateHumanDe(neues_datum)} um ${neue_uhrzeit} Uhr` };
+          return { status: "verschoben", bestaetigung: `${formatDateHumanDe(neues_datum)} um ${zeit} Uhr` };
         }
       })
     };
