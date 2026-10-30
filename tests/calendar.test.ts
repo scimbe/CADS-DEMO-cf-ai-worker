@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  checkBookable,
   getAvailableSlots,
   isSlotFree,
   isWithinBookingHorizon,
@@ -165,5 +166,43 @@ describe("isWithinBookingHorizon", () => {
     const now = zonedTimeToUtcMs(THURSDAY, "10:00");
     const soonDate = toDateStr(now + 5 * 24 * 3600_000);
     expect(isWithinBookingHorizon(soonDate, now)).toBe(true);
+  });
+});
+
+describe("checkBookable", () => {
+  // 2026-11-05 ist ein Donnerstag, 2026-11-08 ein Sonntag, 2026-11-07 ein Samstag (bis 14 Uhr).
+  const now = Date.UTC(2026, 9, 30, 16, 0);
+  const check = (dateStr: string, timeStr: string, service: "schneiden_kurz" | "schneiden_lang" = "schneiden_kurz") =>
+    checkBookable({ dateStr, timeStr, service, now });
+
+  it("laesst normale Zeiten zu", () => {
+    expect(check("2026-11-05", "10:00")).toBe("ok");
+    expect(check("2026-11-05", "17:30")).toBe("ok");
+  });
+
+  it("lehnt geschlossene Tage ab", () => {
+    expect(check("2026-11-08", "11:00")).toBe("geschlossen"); // Sonntag
+    expect(check("2026-11-02", "11:00")).toBe("geschlossen"); // Montag
+  });
+
+  it("lehnt Zeiten ausserhalb der Oeffnungszeiten ab, auch wenn der Termin nur ueberzieht", () => {
+    expect(check("2026-11-05", "03:00")).toBe("ausserhalb_oeffnungszeiten");
+    expect(check("2026-11-05", "17:45")).toBe("ausserhalb_oeffnungszeiten");
+    expect(check("2026-11-07", "13:45", "schneiden_lang")).toBe("ausserhalb_oeffnungszeiten");
+  });
+
+  it("verlangt denselben Vorlauf wie die Verfuegbarkeitspruefung und lehnt Vergangenheit ab", () => {
+    expect(check("2026-10-30", "17:30")).toBe("zu_kurzfristig"); // 30 Min. Vorlauf
+    expect(check("2026-10-01", "10:00")).toBe("zu_kurzfristig");
+  });
+
+  it("lehnt Termine jenseits des Buchungshorizonts ab", () => {
+    expect(check("2027-03-02", "10:00")).toBe("zu_weit_in_zukunft");
+  });
+
+  it("lehnt unlesbare Angaben ab, statt NaN zu speichern", () => {
+    expect(check("morgen", "10:00")).toBe("ungueltig");
+    expect(check("2026-11-05", "abends")).toBe("ungueltig");
+    expect(check("2026-02-31", "10:00")).toBe("ungueltig");
   });
 });

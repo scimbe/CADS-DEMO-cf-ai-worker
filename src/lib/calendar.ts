@@ -226,3 +226,25 @@ export function isWithinBookingHorizon(dateStr: string, now: number): boolean {
   const horizonMs = now + BOOKING_HORIZON_DAYS * 24 * 60 * 60000;
   return ms <= horizonMs;
 }
+
+export type BookableStatus = "ok" | "ungueltig" | "zu_kurzfristig" | "zu_weit_in_zukunft" | "geschlossen" | "ausserhalb_oeffnungszeiten";
+
+/**
+ * Darf zu dieser Zeit ueberhaupt ein Termin beginnen? Unabhaengig von Kollisionen (isSlotFree).
+ * Gilt fuer jede schreibende Aktion: Das Modell allein darf nie entscheiden, ob der Salon offen hat.
+ */
+export function checkBookable(params: { dateStr: string; timeStr: string; service: ServiceKey; now: number }): BookableStatus {
+  const { dateStr, timeStr, service, now } = params;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr) || !/^\d{2}:\d{2}$/.test(timeStr)) return "ungueltig";
+  const startTs = zonedTimeToUtcMs(dateStr, timeStr);
+  if (!Number.isFinite(startTs) || toDateStr(startTs) !== dateStr) return "ungueltig";
+  if (startTs < now + MIN_LEAD_MINUTES * 60000) return "zu_kurzfristig";
+  if (!isWithinBookingHorizon(dateStr, now)) return "zu_weit_in_zukunft";
+  const hours = OPENING_HOURS[weekdayOfDateStr(dateStr)];
+  if (!hours) return "geschlossen";
+  const endTs = startTs + SERVICES[service].durationMin * 60000;
+  if (startTs < zonedTimeToUtcMs(dateStr, hours.open) || endTs > zonedTimeToUtcMs(dateStr, hours.close)) {
+    return "ausserhalb_oeffnungszeiten";
+  }
+  return "ok";
+}
